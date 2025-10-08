@@ -14,35 +14,57 @@ void flash_attention(
     float* d_m,
     int N,
     int d,
-    int Br = 32,
-    int Bc = 32
+    int Bc = 32,  // Block size for columns . for test use.
+    int M = 1024 // Shared memory size limit (in floats) 
 ) {
-    // Algorithm Line 2: Set block sizes Br, Bc
-    // Algorithm Line 3: Initialize O, l, m on HBM (handled by caller)
-    // Algorithm Line 4: Divide Q into Tr = ceil(N/Br) blocks...
+    // Line 1: Set block sizes Br, Bc
+    // Bc = M / ( 4 * d ); to make test easier, we set Bc directly.
+    int Br = min(d, Bc);  // Set Br = min(d, Bc)
     
-    if (d > MAX_D) {
-        printf("Error: d=%d exceeds MAX_D=%d\n", d, MAX_D);
-        return;
+    //Line 2: Initialize O = 0, l = 0, m = -∞ on HBM
+    cudaMemset(d_O, 0, N * d * sizeof(float));  // O = 0
+    cudaMemset(d_l, 0, N * sizeof(float));      // l = 0
+    // Initialize m to -infinity
+    float* h_m_init = new float[N];
+    for (int i = 0; i < N; i++) {
+        h_m_init[i] = -FLT_MAX;
     }
-    
-    
-    // Calculate grid and block dimensions
-    int Tr = (N + Br - 1) / Br;
+    cudaMemcpy(d_m, h_m_init, N * sizeof(float), cudaMemcpyHostToDevice);
+    delete[] h_m_init;
 
-    dim3 threadsPerBlock = new_dim3(min(256, Br), 1, 1);
-    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);
+    //line 3: Calculate Tr = ceil(N/Br), Tc = ceil(N/Bc)
+    // Calculate grid and block dimensions
+    int Tr = (N + Br - 1) / Br; //Q,    O, l, m
+    int Tc = (N + Bc - 1) / Bc; //K, V
+    
+    printf("Flash Attention launch with Br=%d, Bc=%d, Tr=%d, Tc=%d\n", Br, Bc, Tr, Tc);
+    
+    // line 7: for 1 <= i <= Tr do  block and thread implement this loop
+    dim3 threadsPerBlock = new_dim3(Br, 1, 1);  // Each block has Br threads, each thread handles one row of Qi
+    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);    // Each block handles one tile of Qi
 
     // Calculate shared memory size
-    size_t shared_mem_size = sizeof(float) * (Br * d + 2 * Bc * d + Br * Bc);
-    
-    // Launch kernel
-    #ifndef __INTELLISENSE__
-    flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
-        d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc
+    size_t shared_mem_size = sizeof(float) * (
+        Br * d +      // Qi
+        Bc * d +      // Kj
+        Bc * d +      // Vj
+        Br * Bc +     // S
+        Br * Bc +     // P
+        Br * d +      // Oi (in SRAM)
+        Br +          // li (in SRAM)
+        Br            // mi (in SRAM)
     );
-    #endif
 
+    // Launch kernel
+    // line 5: for 1 ≤ i ≤ Tc do
+    for( int j = 0; j < Tc; j++) {
+        #ifndef __INTELLISENSE__
+        flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
+            d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc,  j, 1.0f / sqrtf((float)d)
+        );
+        #endif
+        cudaDeviceSynchronize(); // Ensure sequential execution of blocks
+    }   
     // Check for errors
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -52,9 +74,9 @@ void flash_attention(
 
 
 // Test function
-void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br = 32, int Bc = 32) {
+void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Bc = 32) {
     std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
-    std::cout << "N=" << N << ", d=" << d << ", Br=" << Br << ", Bc=" << Bc << std::endl;
+    std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
     
     // Allocate output memory
     float *h_O = new float[N * d];
@@ -76,7 +98,7 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
     cudaMemcpy(d_V, V, N * d * sizeof(float), cudaMemcpyHostToDevice);
     
     // Run Flash Attention
-    flash_attention(d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc);
+    flash_attention(d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Bc);
     cudaDeviceSynchronize();
     
     // Copy results back
@@ -124,9 +146,8 @@ int main() {
             10, 20, 30, 40,
             50, 60, 70, 80
         };
-        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2, 2);
+        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2);
     }
-    
     // Test 2: Identity attention (perfect match)
     {
         float Q[] = {
@@ -147,7 +168,7 @@ int main() {
             0, 0, 3, 0,
             0, 0, 0, 4
         };
-        run_test("Identity 4x4", Q, K, V, 4, 4, 2, 2);
+        run_test("Identity 4x4", Q, K, V, 4, 4, 2);
     }
     
     // Test 3: All ones (uniform attention)
@@ -167,7 +188,7 @@ int main() {
             3, 4,
             5, 6
         };
-        run_test("Uniform attention 3x2", Q, K, V, 3, 2, 2, 2);
+        run_test("Uniform attention 3x2", Q, K, V, 3, 2, 2);
     }
     
     // Test 4: Orthogonal Q and K (no attention)
@@ -184,7 +205,7 @@ int main() {
             10, 20,
             30, 40
         };
-        run_test("Orthogonal Q,K 2x2", Q, K, V, 2, 2, 2, 2);
+        run_test("Orthogonal Q,K 2x2", Q, K, V, 2, 2, 2);
     }
     
     // Test 5: Single element
@@ -192,7 +213,7 @@ int main() {
         float Q[] = {1};
         float K[] = {1};
         float V[] = {42};
-        run_test("Single element", Q, K, V, 1, 1, 1, 1);
+        run_test("Single element", Q, K, V, 1, 1, 1);
     }
     
     // Test 6: Larger test with patterns
@@ -210,7 +231,7 @@ int main() {
                 V[i * d + j] = i * 10 + j;
             }
         }
-        run_test("Diagonal pattern 8x4", Q, K, V, N, d, 4, 4);
+        run_test("Diagonal pattern 8x4", Q, K, V, N, d, 4);
         
         delete[] Q;
         delete[] K;
@@ -230,7 +251,7 @@ int main() {
             K[i] = (float)rand() / RAND_MAX;
             V[i] = (float)rand() / RAND_MAX * 100;  // Scale V for visibility
         }
-        run_test("Random 64x32", Q, K, V, N, d, 16, 16);
+        run_test("Random 64x32", Q, K, V, N, d, 16);
         
         delete[] Q;
         delete[] K;
@@ -257,9 +278,9 @@ int main() {
             9, 10, 11, 12,
             13, 14, 15, 16
         };
-        run_test("4x4 with Br=1, Bc=1", Q, K, V, 4, 4, 1, 1);
-        run_test("4x4 with Br=2, Bc=2", Q, K, V, 4, 4, 2, 2);
-        run_test("4x4 with Br=4, Bc=4", Q, K, V, 4, 4, 4, 4);
+        run_test("4x4 with Br=1, Bc=1", Q, K, V, 4, 4, 1);
+        run_test("4x4 with Br=2, Bc=2", Q, K, V, 4, 4, 2);
+        run_test("4x4 with Br=4, Bc=4", Q, K, V, 4, 4, 4);
     }
     
     return 0;

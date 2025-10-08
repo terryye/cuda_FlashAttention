@@ -1,7 +1,7 @@
 #include "../../util/cuda_shim.h"
+#include <stdio.h>
+#include <math.h>
 #include <cfloat>
-
-#define MAX_D 256  // Maximum embedding dimension supported
 
 // Kernel for Flash Attention algorithm
 __global__ void flash_attention_kernel(
@@ -14,142 +14,134 @@ __global__ void flash_attention_kernel(
     int N,           // Sequence length
     int d,           // Embedding dimension
     int Br,          // Block rows
-    int Bc          // Block cols
+    int Bc,          // Block cols
+    int tile,        // Current tile index for K,V
+    float scale      // Softmax scale (1/sqrt(d) typically)
 ) {
-
+    /*
+    size_t shared_mem_size = sizeof(float) * (
+        Br * d +      // Qi
+        Bc * d +      // Kj
+        Bc * d +      // Vj
+        Br * Bc +     // S
+        Br * Bc +     // P
+        Br * d +      // Oi (in SRAM)
+        Br +          // li (in SRAM)
+        Br            // mi (in SRAM)
+    );
+     */
     // Shared memory for tiles
     extern __shared__ float shared_mem[];
-    float* Qi = shared_mem;                    // Br x d
-    float* Kj = &shared_mem[Br * d];          // Bc x d
-    float* Vj = &shared_mem[Br * d + Bc * d]; // Bc x d
-    float* S = &shared_mem[Br * d + 2 * Bc * d]; // Br x Bc
+    int mem_offset = 0;
+    float* Qi = shared_mem;                   // Br x d
+    float* Kj = &shared_mem[mem_offset += Br * d]; // Bc x d
+    float* Vj = &shared_mem[mem_offset += Bc * d]; // Bc x d
+    float* S = &shared_mem[mem_offset += Bc * d]; // Br x Bc
+    float* P = &shared_mem[mem_offset += Br * Bc]; // Br x Bc
+    float* Oi = &shared_mem[mem_offset += Br * Bc]; // Br x d
+    float* li = &shared_mem[mem_offset +=  Br * d]; // Br
+    float* mi = &shared_mem[mem_offset +=  Br]; // Br
     
+
     // Thread and block indices
     int tid = threadIdx.x;
     int bid = blockIdx.x;
-    
-    // Number of tiles
-    int Tr = (N + Br - 1) / Br;
-    int Tc = (N + Bc - 1) / Bc;
-    
-    // Each block handles one tile of Q (outer loop iteration)
-    if (bid >= Tr) return;
-    
-    int i_start = bid * Br;
-    int i_end = min(i_start + Br, N); 
-    int tile_size_i = i_end - i_start;
-    
-    // Initialize local accumulators for each thread
-    // Using fixed-size array with MAX_D
-    float Oi_local[MAX_D];
-    float mi_local;
-    float li_local;
-    
-    // Algorithm Line 5: for 1 ≤ i ≤ Tr do
-    // Each block handles one value of i in the outer loop
-    
-    // Algorithm Lines 6-8: Initialize Oi, li, mi
-    if (tid < tile_size_i) {
-        // Initialize Oi = 0 (zeros matrix)
-        for (int k = 0; k < d; k++) {
-            Oi_local[k] = 0.0f;
-        }
-        // Initialize mi = -∞ (negative infinity)
-        mi_local = -FLT_MAX;
-        // Initialize li = 0 (zeros vector)
-        li_local = 0.0f;
-    }
-    
-    // Algorithm Line 6: Load Qi from HBM to on-chip SRAM
-    for (int row = tid; row < tile_size_i; row += blockDim.x) {
-        for (int col = 0; col < d; col++) {
-            Qi[row * d + col] = Q[(i_start + row) * d + col];
-        }
-    }
-    __syncthreads();
-    
-    float scaler = 1.0f / sqrtf((float)d);
+    int num_threads = blockDim.x;
 
-    // Algorithm Line 9: for 1 ≤ j ≤ Tc do
-    // Process all K,V tiles
-    for (int j = 0; j < Tc; j++) {
-        int j_start = j * Bc;
-        int j_end = min(j_start + Bc, N);
-        int tile_size_j = j_end - j_start;
-        
-        // Algorithm Line 10: Load Kj, Vj from HBM to on-chip SRAM
-        for (int idx = tid; idx < tile_size_j * d; idx += blockDim.x) {
-            int row = idx / d;
-            int col = idx % d;
-            Kj[row * d + col] = K[(j_start + row) * d + col];
-            Vj[row * d + col] = V[(j_start + row) * d + col];
+
+    //line 6 liad K,V to SRAM
+    // Algorithm Line 10: Load Kj, Vj from HBM to on-chip SRAM
+    int j_start = tile * Bc;
+    int j_end = j_start + Bc < N ? j_start + Bc : N;
+    int tile_size_j = j_end - j_start; // Actual size of the tile (may be smaller at edges)
+
+    for (int j = 0; j < tile_size_j; j++) {
+        for (int t = 0; t < d / num_threads; t++)
+        {
+            int k = t * num_threads + tid;
+            if (k >= d) continue; // Guard against out-of-bounds
+            //kj[j][k] = K[(j_start + j)][k]; // Load from global memory
+            Kj[j * d + k] = K[(j_start + j) * d + k]; // Load from global memory
+            Vj[j * d + k] = V[(j_start + j) * d + k]; // Load from global memory
         }
-        __syncthreads();
-        
-        // Algorithm Line 11: On chip, compute Sij = QiKj^T ∈ R^(Br×Bc)
-        if (tid < tile_size_i) {
-            for (int jj = 0; jj < tile_size_j; jj++) {
-                float sum = 0.0f;
-                for (int k = 0; k < d; k++) {
-                    sum += Qi[tid * d + k] * Kj[jj * d + k];
-                }
-                S[tid * Bc + jj] = sum * scaler;  // scaler is 1/sqrt(d) scaling factor
-            }
-        }
-        __syncthreads();
-        
-        // Algorithm Lines 11-15: Update statistics and output
-        if (tid < tile_size_i) {
-            // Algorithm Line 11: On chip, compute mij = rowmax(Sij) ∈ R^Br
-            float mij = mi_local;
-            for (int jj = 0; jj < tile_size_j; jj++) {
-                mij = fmaxf(mij, S[tid * Bc + jj]);
-            }
-            
-            // Algorithm Line 12: On chip, compute mi^new = max(mi, mij) ∈ R^Br
-            float mi_new = fmaxf(mi_local, mij);
-            
-            // Algorithm Line 11 (continued): Pij = exp(Sij - mij) ∈ R^(Br×Bc) (pointwise)
-            // Using mi_new instead of mij for numerical stability
-            float Pij_sum = 0.0f;
-            for (int jj = 0; jj < tile_size_j; jj++) {
-                S[tid * Bc + jj] = expf(S[tid * Bc + jj] - mi_new);
-                Pij_sum += S[tid * Bc + jj];
-            }
-            
-            // Algorithm Line 12 (continued): li^new = e^(mi-mi^new) * li + rowsum(Pij) ∈ R^Br
-            float li_new = expf(mi_local - mi_new) * li_local + Pij_sum;
-            
-            // Algorithm Line 13: Write Oi ← diag(li^new)^(-1) * (diag(li) * e^(mi-mi^new) * Oi + PijVj) to HBM
-            // We compute this incrementally in SRAM
-            for (int k = 0; k < d; k++) {
-                float sum = 0.0f;
-                for (int jj = 0; jj < tile_size_j; jj++) {
-                    sum += S[tid * Bc + jj] * Vj[jj * d + k];  // PijVj
-                }
-                // Update Oi using the online softmax formula
-                Oi_local[k] = (li_local * expf(mi_local - mi_new) * Oi_local[k] + sum) / li_new;
-            }
-            
-            // Algorithm Line 14: Write li ← li^new, mi ← mi^new to HBM
-            // We keep these in local registers and write at the end
-            mi_local = mi_new;
-            li_local = li_new;
-        }
-        __syncthreads();
     }
-    
-    // Write final results to HBM
-    if (tid < tile_size_i) {
-        int global_idx = i_start + tid;
-        
-        // Write Oi to HBM (Line 13 - final write)
+
+    // Algorithm Line 5: for 1 ≤ i ≤ Tr do : this is handled by launching multiple threads
+
+    // if tid is out of bounds, return
+    int row = bid * blockDim.x + tid;
+    if (row >= N) {
+        return;
+    }
+
+    // line 8: load Br rows of Qi, Oi, li, mi
+    for (int col = 0; col < d; col++) {
+        Qi[tid * d + col] = Q[row * d + col]; // Load from global memory.  todo: seems put Qi in register is better
+        Oi[tid * d + col] = O[row * d + col];  // Load from global memory
+    }
+    li[tid] = l[row];  // Load from global memory
+    mi[tid] = m[row];  // Load from global memory
+
+    __syncthreads();
+
+    //line 9: compute Sij = QiKj^T / sqrt(d).    size S is Br x Bc
+    for (int j = 0; j < tile_size_j; j++) {
+        //we only compute one row( row tid) of S per thread
+        S[tid * Bc + j] = 0.0f;
         for (int k = 0; k < d; k++) {
-            O[global_idx * d + k] = Oi_local[k];
+            S[tid * Bc + j] += Qi[tid * d + k] * Kj[j * d + k]; // Dot product
         }
-        
-        // Write li, mi to HBM (Line 14 - final write)
-        l[global_idx] = li_local;
-        m[global_idx] = mi_local;
+        S[tid * Bc + j] *= scale; // Scale
     }
-}
+
+    // line 10: compute mij, Pij, lij; for current thread row tid, we only need to compute one row
+    float mij = -FLT_MAX;
+    for (int j = 0; j < tile_size_j; j++) {
+        if (S[tid * Bc + j] > mij) {
+            mij = S[tid * Bc + j]; // Find max
+        }
+    }
+    // Pij = exp(Sij - mij); lij = lij + sum_j Pij
+    float lij = 0.0f;
+    for (int j = 0; j < tile_size_j; j++) {
+        P[tid * Bc + j] = expf(S[tid * Bc + j] - mij); // Subtract max for numerical stability
+        lij += P[tid * Bc + j];
+    }
+
+    //line 11: mi_new, li_new
+    float mi_new = fmaxf(mi[tid], mij);
+    float li_new = li[tid] * expf(mi[tid] - mi_new) + lij * expf(mij - mi_new);
+
+    /*
+    __syncthreads();
+    //print debug info 
+    //print Sij
+
+    if (tid == 0){
+        printf("Tile %d, Block %d, Thread %d, tile_size_j %d: Pij = [", tile, bid, tid, tile_size_j);
+        for (int tid_ = 0; tid_ < 2; tid_++)
+        {
+            for(int j = 0; j < tile_size_j; j++){
+                printf("%f, ", P[tid_ * Bc + j]);
+            }
+        }
+        printf("]\n");
+    }
+    */
+
+    //line 12: Oi = li / li_new * exp(mi_mi_new) * Oi + exp(mij - mi_new)/li_new * Pij Vj
+    for (int col = 0; col < d; col++) {
+        Oi[tid * d + col] = (li[tid] / li_new) * expf(mi[tid] - mi_new) * Oi[tid * d + col];
+        //         
+        for (int j = 0; j < tile_size_j; j++) {
+            Oi[tid * d + col] += (expf(mij - mi_new) / li_new) * P[tid * Bc + j] * Vj[j * d + col];
+        }
+    }
+    //line 13: write back mi_new, li_new, Oi to HBM
+    l[row] = li_new;  // Write back to global memory
+    m[row] = mi_new;  // Write back to global memory
+
+    for (int col = 0; col < d; col++) {
+        O[row * d + col] = Oi[tid * d + col]; // Write back to global memory
+    }
+}        
