@@ -57,14 +57,12 @@ void flash_attention(
 
     // Launch kernel
     // line 5: for 1 ≤ i ≤ Tc do
-    for( int j = 0; j < Tc; j++) {
-        #ifndef __INTELLISENSE__
-        flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
-            d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc,  j, 1.0f / sqrtf((float)d)
-        );
-        #endif
-        cudaDeviceSynchronize(); // Ensure sequential execution of blocks
-    }   
+    #ifndef __INTELLISENSE__
+    flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
+        d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc,1.0f / sqrtf((float)d)
+    );
+    #endif
+    cudaDeviceSynchronize(); // Ensure sequential execution of blocks
     // Check for errors
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
