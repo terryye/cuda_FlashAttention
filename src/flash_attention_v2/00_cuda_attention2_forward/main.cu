@@ -59,7 +59,7 @@ void flash_attention(
 
 
 // Test function
-void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br, int Bc = 32) {
+void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br, int Bc = 8) {
     std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
     std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
     
@@ -126,7 +126,23 @@ int main() {
             10, 20, 30, 40,
             50, 60, 70, 80
         };
-        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2, 4);
+        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2, 2);
+    } 
+    // Test 1: simple 2x4 test
+    {
+        float Q[] = {
+            1, 0, 1, 0,
+            0, 1, 0, 1
+        };
+        float K[] = {
+            1, 0, 1, 0,
+            0, 1, 0, 1
+        };
+        float V[] = {
+            10, 20, 30, 40,
+            50, 60, 70, 80
+        };
+        run_test("Simple 2x4 test", Q, K, V, 2, 4, 1, 1);
     }
     // Test 2: Identity attention (perfect match)
     {
