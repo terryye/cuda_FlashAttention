@@ -56,7 +56,7 @@ __global__ void flash_attention_kernel(
     int tile_size_j = j_end - j_start; // Actual size of the tile (may be smaller at edges)
 
     for (int j = 0; j < tile_size_j; j++) {
-        for (int t = 0; t < d / num_threads; t++)
+        for (int t = 0; t < (d + num_threads - 1) / num_threads; t++)
         {
             int k = t * num_threads + tid;
             if (k >= d) continue; // Guard against out-of-bounds

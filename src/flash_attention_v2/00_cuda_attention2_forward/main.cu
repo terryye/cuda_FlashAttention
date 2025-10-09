@@ -3,39 +3,29 @@
 #include <iostream>
 #include "../../util/cuda_shim.h"
 #include "./flash_attention_kernel.cu"
-
+/**
+ * Flash Attention implementation in CUDA
+ * Reference: https://arxiv.org/abs/2205.14135
+ * in flash attention one, we try to maxmize the Bc, because each iteration will put Oi back to HBM
+ * 
+ */
 // Host function to launch Flash Attention
 void flash_attention(
     const float* d_Q,
     const float* d_K, 
     const float* d_V,
     float* d_O,
-    float* d_l,
-    float* d_m,
+    float* d_L,
     int N,
     int d,
-    int Bc = 32,  // Block size for columns . for test use.
-    int M = 1024 // Shared memory size limit (in floats) 
+    int Br = 32, // Block size for rows
+    int Bc = 32  // Block size for columns
 ) {
-    // Line 1: Set block sizes Br, Bc
-    // Bc = M / ( 4 * d ); to make test easier, we set Bc directly.
-    int Br = min(d, Bc);  // Set Br = min(d, Bc)
     
-    //Line 2: Initialize O = 0, l = 0, m = -∞ on HBM
-    cudaMemset(d_O, 0, N * d * sizeof(float));  // O = 0
-    cudaMemset(d_l, 0, N * sizeof(float));      // l = 0
-    // Initialize m to -infinity
-    float* h_m_init = new float[N];
-    for (int i = 0; i < N; i++) {
-        h_m_init[i] = -FLT_MAX;
-    }
-    cudaMemcpy(d_m, h_m_init, N * sizeof(float), cudaMemcpyHostToDevice);
-    delete[] h_m_init;
-
     //line 3: Calculate Tr = ceil(N/Br), Tc = ceil(N/Bc)
     // Calculate grid and block dimensions
-    int Tr = (N + Br - 1) / Br; //Q,    O, l, m
-    int Tc = (N + Bc - 1) / Bc; //K, V
+    int Tr = (N + Br - 1) / Br; //Q, O, l
+    int Tc = (N + Bc - 1) / Bc; //K, V  no need to use Tc here in this implementation, just for understanding
     
     printf("Flash Attention launch with Br=%d, Bc=%d, Tr=%d, Tc=%d\n", Br, Bc, Tr, Tc);
     
@@ -43,28 +33,23 @@ void flash_attention(
     dim3 threadsPerBlock = new_dim3(Br, 1, 1);  // Each block has Br threads, each thread handles one row of Qi
     dim3 blocksPerGrid = new_dim3(Tr, 1, 1);    // Each block handles one tile of Qi
 
-    // Calculate shared memory size
+    // Calculate shared memory size. for simplicity, we do not reuse shared memory for different variables
     size_t shared_mem_size = sizeof(float) * (
-        Br * d +      // Qi
+        Br * d +      // Qi             
         Bc * d +      // Kj
         Bc * d +      // Vj
         Br * Bc +     // S
         Br * Bc +     // P
-        Br * d +      // Oi (in SRAM)
-        Br +          // li (in SRAM)
-        Br            // mi (in SRAM)
+        Br * d      // Oi (in SRAM).  
     );
 
     // Launch kernel
-    // line 5: for 1 ≤ i ≤ Tc do
-    for( int j = 0; j < Tc; j++) {
-        #ifndef __INTELLISENSE__
-        flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
-            d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Br, Bc,  j, 1.0f / sqrtf((float)d)
-        );
-        #endif
-        cudaDeviceSynchronize(); // Ensure sequential execution of blocks
-    }   
+    #ifndef __INTELLISENSE__
+    flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
+        d_Q, d_K, d_V, d_O, d_L, N, d, Br, Bc, 1.0f / sqrtf((float)d)
+    );
+    #endif
+    cudaDeviceSynchronize(); // Ensure sequential execution of blocks
     // Check for errors
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -74,23 +59,21 @@ void flash_attention(
 
 
 // Test function
-void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Bc = 32) {
+void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br, int Bc = 32) {
     std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
     std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
     
     // Allocate output memory
     float *h_O = new float[N * d];
-    float *h_l = new float[N];
-    float *h_m = new float[N];
+    float *h_L = new float[N];
     
     // Allocate device memory
-    float *d_Q, *d_K, *d_V, *d_O, *d_l, *d_m;
+    float *d_Q, *d_K, *d_V, *d_O, *d_L;
     cudaMalloc((void**)&d_Q, N * d * sizeof(float));
     cudaMalloc((void**)&d_K, N * d * sizeof(float));
     cudaMalloc((void**)&d_V, N * d * sizeof(float));
     cudaMalloc((void**)&d_O, N * d * sizeof(float));
-    cudaMalloc((void**)&d_l, N * sizeof(float));
-    cudaMalloc((void**)&d_m, N * sizeof(float));
+    cudaMalloc((void**)&d_L, N * sizeof(float));
     
     // Copy data to device
     cudaMemcpy(d_Q, Q, N * d * sizeof(float), cudaMemcpyHostToDevice);
@@ -98,13 +81,12 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
     cudaMemcpy(d_V, V, N * d * sizeof(float), cudaMemcpyHostToDevice);
     
     // Run Flash Attention
-    flash_attention(d_Q, d_K, d_V, d_O, d_l, d_m, N, d, Bc);
+    flash_attention(d_Q, d_K, d_V, d_O, d_L, N, d, Br, Bc);
     cudaDeviceSynchronize();
     
     // Copy results back
     cudaMemcpy(h_O, d_O, N * d * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_l, d_l, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_m, d_m, N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_L, d_L, N * sizeof(float), cudaMemcpyDeviceToHost);
     
     // Print results
     std::cout << "Output O:" << std::endl;
@@ -114,19 +96,17 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
             std::cout << h_O[i * d + j] << " ";
         }
         if (d > 8) std::cout << "...";
-        std::cout << " | l=" << h_l[i] << ", m=" << h_m[i] << std::endl;
+        std::cout << " | L=" << h_L[i] << std::endl;
     }
     
     // Cleanup
     delete[] h_O;
-    delete[] h_l;
-    delete[] h_m;
+    delete[] h_L;
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_O);
-    cudaFree(d_l);
-    cudaFree(d_m);
+    cudaFree(d_L);
 }
 
 
@@ -146,7 +126,7 @@ int main() {
             10, 20, 30, 40,
             50, 60, 70, 80
         };
-        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2);
+        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2, 4);
     }
     // Test 2: Identity attention (perfect match)
     {
