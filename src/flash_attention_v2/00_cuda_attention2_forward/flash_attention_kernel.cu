@@ -9,7 +9,7 @@ __global__ void flash_attention_kernel(
     const float* K,  // Key matrix (N x d)
     const float* V,  // Value matrix (N x d)
     float* O,        // Output matrix (N x d)
-    float* L,        // Row sum vector (N)
+    float* L,        // Loss vector (N)
     int N,           // Sequence length
     int d,           // Embedding dimension
     int Br,          // Block rows
