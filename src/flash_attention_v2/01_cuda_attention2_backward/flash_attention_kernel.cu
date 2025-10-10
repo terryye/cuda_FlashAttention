@@ -55,7 +55,7 @@ __global__ void flash_attention_kernel(
 
     int num_threads = N - blockDim.x * bid < blockDim.x ? N - blockDim.x * bid : blockDim.x;
 
-    // Initialize dQi to zero once
+    //Initialize dQi to zero once
     for (int col = 0; col < d; col++) {
         dQi[tid * d + col] = 0.0f;
     }
@@ -90,6 +90,7 @@ __global__ void flash_attention_kernel(
             Oi[tid * d + col] = O[row * d + col];     // Load Oi
             dOi[tid * d + col] = dO[row * d + col];   // Load dOi
             Di += dOi[tid * d + col] * Oi[tid * d + col]; // Compute Di
+            // dQi[tid * d + col] = dQ[row * d + col]; // Load dQi ; we optimize this by loading once before all tiles
         }
         Li = L[row];                       // Load Li
 
@@ -140,6 +141,7 @@ __global__ void flash_attention_kernel(
         for (int k = 0; k < d; k++) {
             for (int j = 0; j < tile_size_j; j++) {
                 dQi[tid * d + k] += dS[tid * Bc + j] * Kj[j * d + k] * scale;  // Apply scale factor
+                //dQ[row * d + k] = dQi[tid * d + k]; // Write back to global memory ; we optimize this by writing back once after all tiles
             }
         }
         __syncthreads();
