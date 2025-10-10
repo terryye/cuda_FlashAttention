@@ -12,7 +12,7 @@ __global__ void flash_attention_kernel(
     const float* V,  // Value matrix (N x d)
     const float* O,  // Output matrix (N x d)
     const float* dO, // Gradient of output matrix (N x d)
-    const float* L, //
+    const float* L, // 
     float* dQ,
     float* dK,
     float* dV,
@@ -43,16 +43,17 @@ __global__ void flash_attention_kernel(
     // Thread and block indices
     int tid = threadIdx.x;
     int bid = blockIdx.x;
-    int num_threads = blockDim.x;
     int row = bid * blockDim.x + tid;
 
     int Tc = (N + Bc - 1) / Bc; // Total number of tiles in columns
-    int Tr = (N + Br - 1) / Br; // Total number of tiles in rows
+//    int Tr = (N + Br - 1) / Br; // Total number of tiles in rows
 
     // Check boundary condition early
     if (row >= N) {
         return;
     }
+
+    int num_threads = N - blockDim.x * bid < blockDim.x ? N - blockDim.x * bid : blockDim.x;
 
     // Initialize dQi to zero once
     for (int col = 0; col < d; col++) {
