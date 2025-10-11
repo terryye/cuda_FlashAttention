@@ -57,31 +57,44 @@ __global__ void flash_attention_kernel(
         int j_start = tile * Bc;
         int j_end = j_start + Bc < N ? j_start + Bc : N;
         int tile_size_j = j_end - j_start; // Actual size of the tile (may be smaller at edges)
-
-        for (int j = 0; j < tile_size_j; j++) {
-            for (int t = 0; t < (d + num_threads - 1) / num_threads; t++)
-            {
-                int k = t * num_threads + tid;
-                if (k >= d) continue; // Guard against out-of-bounds
-                //kj[j][k] = K[(j_start + j)][k]; // Load from global memory
-                Kj[j * d + k] = K[(j_start + j) * d + k]; // Load from global memory
-                Vj[j * d + k] = V[(j_start + j) * d + k]; // Load from global memory
-            }
+        int row = bid * blockDim.x + tid;
+        
+        // Load Kj, Vj
+        int actual_Bc = N - tile * Bc < Bc ? N - tile * Bc : Bc;
+        int actual_Bc_d = actual_Bc * d;
+        int elements_per_thread_j = (actual_Bc_d + num_threads - 1) / num_threads;
+        for (int t = 0; t < elements_per_thread_j; t++) {
+            int index = t * num_threads + tid;
+            if (index >= actual_Bc_d) continue; // Guard against out-of-bounds
+            int j = index / d; // Row index within the tile
+            int k = index % d; // Column index
+            Kj[j * d + k] = K[(tile * Bc + j) * d + k]; // Load from global memory
+            Vj[j * d + k] = V[(tile * Bc + j) * d + k]; // Load from global memory
         }
+        __syncthreads();
 
         // Algorithm Line 5: for 1 ≤ i ≤ Tr do : this is handled by launching multiple threads
 
+        // line 8: load Br rows of Qi, Oi coalesced from HBM to SRAM
+        int actual_Br = N - bid * blockDim.x < blockDim.x ? N - bid * blockDim.x : blockDim.x;
+        int actual_Br_d = actual_Br * d;
+        int elements_per_thread = (actual_Br_d + num_threads - 1) / num_threads;
+        for (int t = 0; t < elements_per_thread; t++) {
+            int index = t * num_threads + tid;
+            if (index >= actual_Br_d) continue; // Guard against out-of-bounds
+            int i = index / d; // Row index within the tile
+            int k = index % d; // Column index
+            Qi[i * d + k] = Q[(bid * blockDim.x + i) * d + k]; // Load from global memory
+            Oi[i * d + k] = O[(bid * blockDim.x + i) * d + k]; // Load from global memory
+        }
+        
+        __syncthreads();
         // if tid is out of bounds, return
-        int row = bid * blockDim.x + tid;
         if (row >= N) {
             return;
         }
 
-        // line 8: load Br rows of Qi, Oi, li, mi
-        for (int col = 0; col < d; col++) {
-            Qi[tid * d + col] = Q[row * d + col]; // Load from global memory.  todo: seems put Qi in register is better
-            Oi[tid * d + col] = O[row * d + col];  // Load from global memory
-        }
+        //load li, mi
         li[tid] = l[row];  // Load from global memory
         mi[tid] = m[row];  // Load from global memory
 

@@ -72,6 +72,42 @@ void flash_attention(
 
 
 // Test function
+#include <cmath>
+#include <cassert>
+
+// Naive CPU attention for verification
+void naive_attention(const float* Q, const float* K, const float* V, float* O, int N, int d) {
+    for (int i = 0; i < N; ++i) {
+        float* out = &O[i * d];
+        std::fill(out, out + d, 0.0f);
+        float max_score = -FLT_MAX;
+        float* scores = new float[N];
+        // Compute scores
+        for (int j = 0; j < N; ++j) {
+            float score = 0.0f;
+            for (int k = 0; k < d; ++k)
+                score += Q[i * d + k] * K[j * d + k];
+            score /= sqrtf((float)d);
+            scores[j] = score;
+            if (score > max_score) max_score = score;
+        }
+        // Softmax normalization
+        float sum_exp = 0.0f;
+        for (int j = 0; j < N; ++j) {
+            scores[j] = expf(scores[j] - max_score);
+            sum_exp += scores[j];
+        }
+        // Weighted sum
+        for (int j = 0; j < N; ++j) {
+            for (int k = 0; k < d; ++k)
+                out[k] += scores[j] * V[j * d + k];
+        }
+        for (int k = 0; k < d; ++k)
+            out[k] /= sum_exp;
+        delete[] scores;
+    }
+}
+
 void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Bc = 32) {
     std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
     std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
@@ -114,11 +150,39 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
         if (d > 8) std::cout << "...";
         std::cout << " | l=" << h_l[i] << ", m=" << h_m[i] << std::endl;
     }
+
+    // Naive CPU reference
+    float* ref_O = new float[N * d];
+    naive_attention(Q, K, V, ref_O, N, d);
+
+    // Compare results
+    bool correct = true;
+    float max_diff = 0.0f;
+    for (int i = 0; i < N * d; ++i) {
+        float diff = fabs(h_O[i] - ref_O[i]);
+        if (diff > 1e-3f) correct = false;
+        if (diff > max_diff) max_diff = diff;
+    }
+    std::cout << "Verification: " << (correct ? "PASS" : "FAIL") << " (max diff = " << max_diff << ")" << std::endl;
+
+    // Optionally print reference output for debugging
+    if (!correct) {
+        std::cout << "Reference O:" << std::endl;
+        for (int i = 0; i < N; i++) {
+            std::cout << "Row " << i << ": ";
+            for (int j = 0; j < d && j < 8; j++) {
+                std::cout << ref_O[i * d + j] << " ";
+            }
+            if (d > 8) std::cout << "...";
+            std::cout << std::endl;
+        }
+    }
     
     // Cleanup
     delete[] h_O;
     delete[] h_l;
     delete[] h_m;
+    delete[] ref_O;
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);

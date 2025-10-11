@@ -1,6 +1,9 @@
 
 #include <stdio.h>
 #include <iostream>
+#include <cmath>
+#include <cstdlib>
+#include <cfloat>
 #include "../../util/cuda_shim.h"
 #include "./flash_attention_kernel.cu"
 /**
@@ -59,6 +62,52 @@ void flash_attention(
 
 
 // Test function
+// Naive CPU implementation for verification
+void naive_attention(const float* Q, const float* K, const float* V, float* O, float* L, int N, int d) {
+    float scale = 1.0f / sqrtf((float)d);
+    
+    // Allocate temporary array for scores
+    float* scores = (float*)malloc(N * sizeof(float));
+    
+    for (int i = 0; i < N; i++) {
+        // Compute attention scores
+        float max_score = -1e30f;
+        for (int j = 0; j < N; j++) {
+            float dot = 0.0f;
+            for (int k = 0; k < d; k++) {
+                dot += Q[i * d + k] * K[j * d + k];
+            }
+            scores[j] = dot * scale;
+            if (scores[j] > max_score) max_score = scores[j];
+        }
+        // Softmax normalization
+        float sum_exp = 0.0f;
+        for (int j = 0; j < N; j++) {
+            scores[j] = expf(scores[j] - max_score);
+            sum_exp += scores[j];
+        }
+        // Normalize by sum_exp
+        for (int j = 0; j < N; j++) {
+            scores[j] /= sum_exp;
+        }
+        
+        // Store L value (log sum exp for this row)
+        L[i] = logf(sum_exp) + max_score;
+        
+        // Output
+        for (int k = 0; k < d; k++) {
+            O[i * d + k] = 0.0f;
+        }
+        for (int j = 0; j < N; j++) {
+            for (int k = 0; k < d; k++) {
+                O[i * d + k] += scores[j] * V[j * d + k];
+            }
+        }
+    }
+    
+    free(scores);
+}
+
 void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br, int Bc = 8) {
     std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
     std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
@@ -88,20 +137,43 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
     cudaMemcpy(h_O, d_O, N * d * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_L, d_L, N * sizeof(float), cudaMemcpyDeviceToHost);
     
-    // Print results
-    std::cout << "Output O:" << std::endl;
+    // Naive CPU reference
+    float* ref_O = (float*)malloc(N * d * sizeof(float));
+    float* ref_L = (float*)malloc(N * sizeof(float));
+    naive_attention(Q, K, V, ref_O, ref_L, N, d);
+
+    // Print results and compare
+    std::cout << "Output O (CUDA) vs Naive:" << std::endl;
+    bool all_ok = true;
     for (int i = 0; i < N; i++) {
         std::cout << "Row " << i << ": ";
-        for (int j = 0; j < d && j < 8; j++) {  // Print first 8 values
+        for (int j = 0; j < d && j < 8; j++) {
             std::cout << h_O[i * d + j] << " ";
         }
         if (d > 8) std::cout << "...";
-        std::cout << " | L=" << h_L[i] << std::endl;
+        std::cout << " | L=" << h_L[i];
+
+        // Compare with naive
+        float max_err = 0.0f;
+        for (int j = 0; j < d; j++) {
+            float err = fabs(h_O[i * d + j] - ref_O[i * d + j]);
+            if (err > max_err) max_err = err;
+        }
+        float l_err = fabs(h_L[i] - ref_L[i]);
+        if (max_err > 1e-3f || l_err > 1e-3f) all_ok = false;
+        std::cout << " | MaxErr=" << max_err << " Lerr=" << l_err << std::endl;
+    }
+    if (all_ok) {
+        std::cout << "Test PASSED: CUDA and naive results match (within tolerance)." << std::endl;
+    } else {
+        std::cout << "Test FAILED: CUDA and naive results differ!" << std::endl;
     }
     
     // Cleanup
     delete[] h_O;
     delete[] h_L;
+    free(ref_O);
+    free(ref_L);
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);
