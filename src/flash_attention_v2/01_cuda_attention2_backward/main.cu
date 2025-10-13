@@ -294,29 +294,29 @@ void run_test(const char* test_name, float* Q, float* K, float* V,
     float* naive_dK = new float[N * d];
     float* naive_dV = new float[N * d];
     naive_attention_backward(Q, K, V, O, L, dO, naive_dQ, naive_dK, naive_dV, N, d, scale);
-
-    printf("\n[Naive] Gradient dQ:\n");
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < d; j++) {
-            printf("%8.4f ", naive_dQ[i * d + j]);
+    if (false){
+        printf("\n[Naive] Gradient dQ:\n");
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < d; j++) {
+                printf("%8.4f ", naive_dQ[i * d + j]);
+            }
+            printf("\n");
         }
-        printf("\n");
-    }
-    printf("\n[Naive] Gradient dK:\n");
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < d; j++) {
-            printf("%8.4f ", naive_dK[i * d + j]);
+        printf("\n[Naive] Gradient dK:\n");
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < d; j++) {
+                printf("%8.4f ", naive_dK[i * d + j]);
+            }
+            printf("\n");
         }
-        printf("\n");
-    }
-    printf("\n[Naive] Gradient dV:\n");
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < d; j++) {
-            printf("%8.4f ", naive_dV[i * d + j]);
+        printf("\n[Naive] Gradient dV:\n");
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < d; j++) {
+                printf("%8.4f ", naive_dV[i * d + j]);
+            }
+            printf("\n");
         }
-        printf("\n");
     }
-
     // Validation
     auto check_match = [](const char* name, float* ref, float* test, int size) {
         bool passed = true;
