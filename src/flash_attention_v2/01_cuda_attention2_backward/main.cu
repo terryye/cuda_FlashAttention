@@ -60,13 +60,93 @@ void compute_forward_pass(const float* Q, const float* K, const float* V,
 }
 
 // Generic test runner for different configurations
+// Naive backward pass for attention (for verification)
+void naive_attention_backward(const float* Q, const float* K, const float* V,
+                             const float* O, const float* L, const float* dO,
+                             float* dQ, float* dK, float* dV,
+                             int N, int d, float scale) {
+    // Compute S = Q * K^T * scale
+    float* S = new float[N * N];
+    float* P = new float[N * N];
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++) {
+                sum += Q[i * d + k] * K[j * d + k];
+            }
+            S[i * N + j] = sum * scale;
+        }
+    }
+    // Softmax
+    for (int i = 0; i < N; i++) {
+        float max_val = -1e9f;
+        for (int j = 0; j < N; j++) max_val = fmax(max_val, S[i * N + j]);
+        float sum = 0.0f;
+        for (int j = 0; j < N; j++) {
+            P[i * N + j] = expf(S[i * N + j] - max_val);
+            sum += P[i * N + j];
+        }
+        for (int j = 0; j < N; j++) P[i * N + j] /= sum;
+    }
+    // Backward pass
+    // dV = P^T * dO
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < d; j++)
+            dV[i * d + j] = 0.0f;
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            for (int k = 0; k < d; k++)
+                dV[j * d + k] += P[i * N + j] * dO[i * d + k];
+    // dP = dO * V^T
+    float* dP = new float[N * N];
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++)
+                sum += dO[i * d + k] * V[j * d + k];
+            dP[i * N + j] = sum;
+        }
+    // dS = dP * softmax jacobian
+    float* dS = new float[N * N];
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            float s = 0.0f;
+            for (int k = 0; k < N; k++) {
+                float J = (j == k ? P[i * N + j] * (1 - P[i * N + k]) : -P[i * N + j] * P[i * N + k]);
+                s += dP[i * N + k] * J;
+            }
+            dS[i * N + j] = s;
+        }
+    }
+    // dQ = dS * K
+    for (int i = 0; i < N; i++)
+        for (int k = 0; k < d; k++) {
+            float sum = 0.0f;
+            for (int j = 0; j < N; j++)
+                sum += dS[i * N + j] * K[j * d + k];
+            dQ[i * d + k] = sum * scale;
+        }
+    // dK = dS^T * Q
+    for (int i = 0; i < N; i++)
+        for (int k = 0; k < d; k++) {
+            float sum = 0.0f;
+            for (int j = 0; j < N; j++)
+                sum += dS[j * N + i] * Q[j * d + k];
+            dK[i * d + k] = sum * scale;
+        }
+    delete[] S;
+    delete[] P;
+    delete[] dP;
+    delete[] dS;
+}
+
 void run_test(const char* test_name, float* Q, float* K, float* V, 
               int N, int d, int block_size, float* dO = nullptr, float* expected_dV = nullptr) {
     const int Br = block_size;
     const int Bc = block_size;
     const float scale = 1.0f / sqrtf(d);
         
-    int Tc = (N + Bc - 1) / Bc; // line 7: for 1 <= j <= Tc do
+    int Tc = (N + Bc - 1) / Bc;
     int Tr = (N + Br - 1) / Br;
 
     printf("\n\n%s\n", test_name);
@@ -163,11 +243,9 @@ void run_test(const char* test_name, float* Q, float* K, float* V,
                     4 * Br * Bc)     // s_Sij, s_Pij, s_dPij, s_dSij
                     * sizeof(float);
 
-    // line 7: for 1 <= i <= Tr do  block and thread implement this loop
-    dim3 threadsPerBlock = new_dim3(Br, 1, 1);  // Each block has Br threads, each thread handles one row of Qi
-    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);    // Each block handles one tile of Qi
+    dim3 threadsPerBlock = new_dim3(Br, 1, 1);
+    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);
 
-    // Use template specialization based on d value
     #ifndef __INTELLISENSE__
         flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, smem_size>>>(
         d_Q, d_K, d_V, d_O, d_dO, d_L, d_dQ, d_dK, d_dV, N, d, Br, Bc, scale
@@ -210,7 +288,50 @@ void run_test(const char* test_name, float* Q, float* K, float* V,
         }
         printf("\n");
     }
-    
+
+    // Compare with naive backward
+    float* naive_dQ = new float[N * d];
+    float* naive_dK = new float[N * d];
+    float* naive_dV = new float[N * d];
+    naive_attention_backward(Q, K, V, O, L, dO, naive_dQ, naive_dK, naive_dV, N, d, scale);
+
+    printf("\n[Naive] Gradient dQ:\n");
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < d; j++) {
+            printf("%8.4f ", naive_dQ[i * d + j]);
+        }
+        printf("\n");
+    }
+    printf("\n[Naive] Gradient dK:\n");
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < d; j++) {
+            printf("%8.4f ", naive_dK[i * d + j]);
+        }
+        printf("\n");
+    }
+    printf("\n[Naive] Gradient dV:\n");
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < d; j++) {
+            printf("%8.4f ", naive_dV[i * d + j]);
+        }
+        printf("\n");
+    }
+
+    // Validation
+    auto check_match = [](const char* name, float* ref, float* test, int size) {
+        bool passed = true;
+        for (int i = 0; i < size; i++) {
+            if (fabs(ref[i] - test[i]) > 1e-3) {
+                printf("%s MISMATCH at %d: got %.4f, expected %.4f\n", name, i, test[i], ref[i]);
+                passed = false;
+            }
+        }
+        if (passed) printf("✓ PASSED: %s matches naive\n", name);
+    };
+    check_match("dQ", naive_dQ, dQ, N * d);
+    check_match("dK", naive_dK, dK, N * d);
+    check_match("dV", naive_dV, dV, N * d);
+
     // Verify against expected values if provided
     if (expected_dV != nullptr) {
         printf("\nValidation against expected dV:\n");
@@ -237,6 +358,9 @@ void run_test(const char* test_name, float* Q, float* K, float* V,
     delete[] dQ;
     delete[] dK;
     delete[] dV;
+    delete[] naive_dQ;
+    delete[] naive_dK;
+    delete[] naive_dV;
     
     cudaFree(d_Q);
     cudaFree(d_K);

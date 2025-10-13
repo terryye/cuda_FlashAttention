@@ -114,10 +114,10 @@ __global__ void flash_attention_kernel(
   
         __syncthreads();
 
-        //compute dVj
-        for (int col = 0; col < d; col++) {
-            for (int j = 0; j < tile_size_j; j++) {
-                dVj[j * d + col] += P[tid * Bc + j] * dOi[tid * d + col];
+        //compute dVj - each thread contributes to dV for its row
+        for (int j = 0; j < tile_size_j; j++) {
+            for (int col = 0; col < d; col++) {
+                atomicAdd(&dVj[j * d + col], P[tid * Bc + j] * dOi[tid * d + col]);
             }
         }
         __syncthreads();
@@ -146,10 +146,10 @@ __global__ void flash_attention_kernel(
         }
         __syncthreads();
         
-        //line 16: compute dKj
-        for (int k = 0; k < d; k++) {
-            for (int j = 0; j < tile_size_j; j++) {
-                dKj[j * d + k] += dS[tid * Bc + j] * Qi[tid * d + k] * scale;  // Apply scale factor
+        //line 16: compute dKj - each thread contributes to dK for its row
+        for (int j = 0; j < tile_size_j; j++) {
+            for (int k = 0; k < d; k++) {
+                atomicAdd(&dKj[j * d + k], dS[tid * Bc + j] * Qi[tid * d + k] * scale);  // Apply scale factor
             }
         }
         __syncthreads();
