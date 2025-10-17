@@ -31,18 +31,31 @@ void flash_attention(
     // Calculate grid and block dimensions
     int Tr = (N + Br - 1) / Br; //Q, O, l
     int Tc = (N + Bc - 1) / Bc; //K, V  no need to use Tc here in this implementation, just for understanding
+   
     
-    printf("Flash Attention launch with Br=%d, Bc=%d, Tr=%d, Tc=%d, N=%d, d=%d, WarpSize=%d\n", Br, Bc, Tr, Tc, N, d, WARP_SIZE);
-    if ( N % WARP_SIZE != 0 || Bc % WARP_SIZE != 0 ) {
-        // __shfl_down_sync assumes all warps hanle the same row index of Sij
-        printf("for better performace, N , Bc should be multiple of WARP_SIZE=%d for this kernel\n", WARP_SIZE);
+    /**
+     * Requirement check, make sure 1 thread handle one row of Q, it is efficient and reduce implimantation complexity : 
+     * if Br % WARP_SIZE != 0; we can NOT get best performance
+     * if Br < WARP_SIZE; this kernel can NOT work
+     */
+    if (Br % WARP_SIZE != 0 ) {
+        printf("Br=%d should be multiple of WARP_SIZE=%d to get better performance for this kernel\n", Br, WARP_SIZE);
     }
 
+    if ( Br < WARP_SIZE ) {
+        printf("for better performace,  Br=%d must be equal or greater than WARP_SIZE=%d for this kernel\n", Br, WARP_SIZE);
+        // do nothing
+    }
     
-    // line 7: for 1 <= i <= Tr do  block and thread implement this loop
-    dim3 threadsPerBlock = new_dim3( WARP_SIZE, 1, 1);
-    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);
+    int NumberOfWarps = (Br + WARP_SIZE - 1) / WARP_SIZE; // number of warps per block
 
+    // line 7: for 1 <= i <= Tr do  block and thread implement this loop
+    dim3 threadsPerBlock = new_dim3( WARP_SIZE * NumberOfWarps, 1, 1);
+    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);
+ 
+    printf("Flash Attention launch with Br=%d, Bc=%d, Tr=%d, Tc=%d, N=%d, d=%d, WarpSize=%d, #ofWarps=%d\n", Br, Bc, Tr, Tc, N, d, WARP_SIZE, NumberOfWarps);
+    
+    
     // Calculate shared memory size. for simplicity, we do not reuse shared memory for different variables
     size_t shared_mem_size = sizeof(float) * (
         Br * d +      // Qi
@@ -203,7 +216,7 @@ int main() {
             3, 4,
             5, 6
         };
-        run_test("Uniform attention 3x2", Q, K, V, 3, 2, 2);
+        run_test("Uniform attention 3x2", Q, K, V, 3, 2, 2, 2);
     }
     
     // Test 5: Orthogonal Q and K (no attention)
@@ -220,7 +233,7 @@ int main() {
             10, 20,
             30, 40
         };
-        run_test("Orthogonal Q,K 2x2", Q, K, V, 2, 2, 2);
+        run_test("Orthogonal Q,K 2x2", Q, K, V, 2, 2, 2, 2);
     }
     
     // Test 6: Single element
@@ -266,7 +279,7 @@ int main() {
             K[i] = (float)rand() / RAND_MAX;
             V[i] = (float)rand() / RAND_MAX * 100;  // Scale V for visibility
         }
-        run_test("Random 64x32", Q, K, V, N, d, 16);
+        run_test("Random 64x32", Q, K, V, N, d, 2);
         
         delete[] Q;
         delete[] K;
