@@ -49,7 +49,6 @@ __global__ void flash_attention_kernel(
     float* Oi = &shared_mem[mem_offset += Br * Bc]; // Br x d
     float* li = &shared_mem[mem_offset += Br * d]; // Br * 1
     float* mi = &shared_mem[mem_offset += Br * 1]; // Br * 1
-    float* li_pre = &shared_mem[mem_offset += Br * 1]; // Br * 1
     float* mi_pre = &shared_mem[mem_offset += Br * 1]; // Br * 1
 
     // Thread and block indices
@@ -76,12 +75,12 @@ __global__ void flash_attention_kernel(
     }
 
     __syncthreads(); // Ensure all threads have loaded Qi before proceeding
-
     // Initialize mi to -inf and li to 0
-    for ( int k = tid ; k < Br ; k += tnum ) {
-        mi[k] = -FLT_MAX; // Initialize mi to -inf
-        li[k] = 0.0f;     // Initialize li to 0
+    for ( int row = tid ; row < Br ; row += tnum ) {
+        mi[row] = -FLT_MAX; // Initialize mi to -inf
+        li[row] = 0.0f;     // Initialize li to 0
     }
+
 
 
     //line 6 
@@ -149,7 +148,6 @@ __global__ void flash_attention_kernel(
                 }
             }
         }
-        __syncthreads(); 
     }
     // __syncthreads(); //we don't need this because each thread only writes to its own li[row], Pij is local 
     
@@ -167,6 +165,5 @@ __global__ void flash_attention_kernel(
             L[i_start + idx] = logf(li[idx]) + mi[idx];
         }
     }
-    __syncthreads();
 
 }   
