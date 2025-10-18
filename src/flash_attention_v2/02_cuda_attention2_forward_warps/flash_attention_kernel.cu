@@ -226,8 +226,7 @@ void flash_attention_2_forward(
         );
         #endif
     } else {
-        
-        #ifndef INTELLISENSE
+        #ifndef __INTELLISENSE__
         flash_attention_2_forward_kernel<Br, Bc, 128, num_warps><<<grid, block, smem_size, stream>>>(
             Q, K, V, O, L, seq_len, head_dim, softmax_scale
         );
