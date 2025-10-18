@@ -1,169 +1,236 @@
+#pragma once
+
 #include "../../util/cuda_shim.h"
+#include "../../util/assertc.h"
 #include <stdio.h>
 #include <math.h>
 #include <cfloat>
+#include <math.h>
+#include <float.h>
 
-__device__ int div_ceil(int a, int b) {
+
+#define WARP_SIZE 32
+#define FULL_MASK 0xffffffff
+
+// Helper function to get number of blocks
+__host__ __device__ inline int div_up(int a, int b) {
     return (a + b - 1) / b;
 }
 
-#define WARP_SIZE 2  // For testing with small N
+// Warp-level reduction for sum
+__device__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+        val += __shfl_xor_sync(FULL_MASK, val, mask);
+    }
+    return val;
+}
 
-
-// Kernel for Flash Attention algorithm
-__global__ void flash_attention_kernel(
-    const float* Q,  // Query matrix (N x d)
-    const float* K,  // Key matrix (N x d)
-    const float* V,  // Value matrix (N x d)
-    float* O,        // Output matrix (N x d)
-    float* L,        // Loss vector (N)
-    int N,           // Sequence length
-    int d,           // Embedding dimension
-    int Br,          // Block rows
-    int Bc,          // Block cols
-    float scale      // Softmax scale (1/sqrt(d) typically)
+template <int Br, int Bc, int d_max, int num_warps>
+__global__ void flash_attention_2_forward_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    float* __restrict__ L,
+    const int N,
+    const int d,
+    const float softmax_scale
 ) {
-    /*
-    size_t shared_mem_size = sizeof(float) * (
-        Br * d +      // Qi
-        Bc * d +      // Kj
-        Bc * d +      // Vj
-        Br * Bc +     // S
-        Br * Bc +     // P
-        Br * d +      // Oi 
-        Br * 1 +      // li 
-        Br * 1 +      // mi 
-        Br * 1 +      // li_pre 
-        Br * 1        // mi_pre 
-
-    );
-    */
-    // Shared memory for tiles
-    extern __shared__ float shared_mem[];
-    int mem_offset = 0;
-    float* Qi = shared_mem;                   // Br x d
-    float* Kj = &shared_mem[mem_offset += Br * d]; // Bc x d
-    float* Vj = &shared_mem[mem_offset += Bc * d]; // Bc x d
-    float* S = &shared_mem[mem_offset += Bc * d]; // Br x Bc
-    float* P = &shared_mem[mem_offset += Br * Bc]; // Br x Bc
-    float* Oi = &shared_mem[mem_offset += Br * Bc]; // Br x d
-    float* li = &shared_mem[mem_offset += Br * d]; // Br * 1
-    float* mi = &shared_mem[mem_offset += Br * 1]; // Br * 1
-    float* mi_pre = &shared_mem[mem_offset += Br * 1]; // Br * 1
-
-    // Thread and block indices
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    int tnum = blockDim.x * blockDim.y; // Number of threads per block
-
-//    int Tr = (N + Br - 1) / Br; // Total number of row tiles
-    int Tc = (N + Bc - 1) / Bc; // Total number of col tiles
-
-    //line 4: load Qi , init Oi
-    int i_start = bid * Br;
-    int i_end = i_start + Br < N ? i_start + Br : N;
-    int tile_size_i = i_end - i_start; // Actual size of the tile (may be smaller at edges)
-    int total_Qi = tile_size_i * d;
-
+    // Thread block handles one block row of attention matrix
+    const int row_block_idx = blockIdx.x;
     
-    for(int idx = tid; idx < total_Qi; idx += tnum ) {
-        int local_row = idx / d;        // Which row in the tile
-        int col = idx % d;              // Which column 
-        int global_row = i_start + local_row;  // Global row index
-        Qi[idx] = Q[global_row * d + col];     // Correct 2D indexing
-        Oi[idx] = 0.0f;                      // Initialize Oi to zero
-    }
-
-    __syncthreads(); // Ensure all threads have loaded Qi before proceeding
-    // Initialize mi to -inf and li to 0
-    for ( int row = tid ; row < Br ; row += tnum ) {
-        mi[row] = -FLT_MAX; // Initialize mi to -inf
-        li[row] = 0.0f;     // Initialize li to 0
-    }
-
-
-
-    //line 6 
-    for(int tile = 0; tile < Tc; tile++) { // Loop over tiles of K,V
-        // Algorithm Line 10: Load Kj, Vj from HBM to on-chip SRAM
-        int j_start = tile * Bc;
-        int j_end = j_start + Bc < N ? j_start + Bc : N;
-        int tile_size_j = j_end - j_start; // Actual size of the tile (may be smaller at edges)
-
-        for(int idx = tid; idx < tile_size_j * d; idx += tnum) {
-            int local_row = idx / d;        // Which row in the tile
-            int col = idx % d;              // Which column 
-            int global_row = j_start + local_row;  // Global row index
-            Kj[idx] = K[global_row * d + col];     // Correct 2D indexing
-            Vj[idx] = V[global_row * d + col];     // Correct 2D indexing
-        }
-        __syncthreads(); // Ensure all threads have loaded Kj, Vj before proceeding
-
-        // line 8 compute Sij = QiKj^T / sqrt(d). mi    size S is Br x Bc
-        // one thread handles one row of Sij
-        for (int row = tid; row < tile_size_i; row += tnum) {
-
-            mi_pre[row] = mi[row]; // Store previous mi
-            for (int col = 0; col < tile_size_j; col++) {
-                float dot_product = 0.0f;
-                for (int k = 0; k < d; k++) {
-                    dot_product += Qi[row * d + k] * Kj[col * d + k];
-                }
-                float Sij = dot_product * scale; // Scale by 1/sqrt(d)
-                S[row * Bc + col] = Sij; // Store Sij
-
-                // Update mi[row] = max(mi[row], Sij)
-                mi[row] = fmaxf(mi[row], Sij);
-            }
-        }
-        // __syncthreads(); //  we don't need this because each thread only writes to its own mi[row], and S is local to this tile
-
-        // line 9 : Pij = exp(Sij - mi); li;
-        for (int row = tid; row < tile_size_i; row += tnum) {
-            li[row] = li[row] * exp(mi_pre[row] - mi[row]); // update li[row]
-            for (int col = 0; col < tile_size_j; col++) {
-                float Sij = S[row * Bc + col];
-                float pij = expf(Sij - mi[row]); // Compute Pij
-                P[row * Bc + col] = pij; // Store Pij
-
-                // Update li[row] += pij
-                li[row] += pij;
-            }
-        }
-        // __syncthreads(); //  we don't need this because each thread only writes to its own li[row], Pij is local to this tile
-
-        //line 10: Oi = Oi*exp(mi_pre - mi) + Pij Vj
-        //one thread handles one row of Oi
-        for(int row = tid; row < tile_size_i; row += tnum) {
-            // Scale existing Oi by exp(mi_pre - mi)
-            float scale_Oi = expf(mi_pre[row] - mi[row]);
-            for(int col = 0; col < d; col++) {
-                Oi[row * d + col] *= scale_Oi;
-            }
-            // Accumulate Pij * Vj
-            for(int j_col = 0; j_col < tile_size_j; j_col++) {
-                float pij = P[row * Bc + j_col];
-                for(int v_col = 0; v_col < d; v_col++) {
-                    Oi[row * d + v_col] += pij * Vj[j_col * d + v_col];
-                }
-            }
-        }
-    }
-    // __syncthreads(); //we don't need this because each thread only writes to its own li[row], Pij is local 
+    // Shared memory for K and V tiles
+    extern __shared__ float smem[];
+    float* K_smem = smem; // [Bc][d]
+    float* V_smem = smem + Bc * d; // [Bc][d]
     
-    //12 compute Oi, Oi / li; 
-    for(int idx = tid; idx < tile_size_i * d; idx += tnum){
-        int row = idx / d; // Row index in Oi (0 to Br-1)
-        Oi[idx] = Oi[idx] / li[row]; // Normalize Oi by li
-        // Write back Oi to global memory
-        O[(i_start + row) * d + (idx % d)] = Oi[idx];
-    }
-    //compute L, L = log(li) + mi; write back L to global memory
-    for (int idx = tid; idx < tile_size_i; idx += tnum)
-    {
-        if (idx < tile_size_i) {
-            L[i_start + idx] = logf(li[idx]) + mi[idx];
+    // Thread and warp identifiers
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_threads = blockDim.x;
+    
+    // Each warp handles different rows
+    const int rows_per_warp = Br / num_warps;
+    const int warp_row_start = warp_id * rows_per_warp;
+    
+    // Global row indices for this thread block
+    const int global_row_start = row_block_idx * Br;
+    const int global_row_end = min(global_row_start + Br, N);
+    
+    // Registers for Q tile (each warp loads its portion)
+    float Q_reg[rows_per_warp][d_max];
+    
+    // Load Q tile for this warp
+    for (int local_row = 0; local_row < rows_per_warp; local_row++) {
+        int global_row = global_row_start + warp_row_start + local_row;
+        if (global_row < global_row_end) {
+            for (int col = lane_id; col < d; col += WARP_SIZE) {
+                Q_reg[local_row][col] = Q[global_row * d + col];
+            }
+        } else {
+            for (int col = lane_id; col < d; col += WARP_SIZE) {
+                Q_reg[local_row][col] = 0.0f;
+            }
         }
     }
+    
+    // Ensure all threads in warp have loaded their Q values
+    __syncwarp();
+    
+    // Initialize row-wise statistics
+    float m[rows_per_warp];
+    float l[rows_per_warp];
+    float O_acc[rows_per_warp][d_max];
+    
+    #pragma unroll
+    for (int i = 0; i < rows_per_warp; i++) {
+        m[i] = -INFINITY;
+        l[i] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < d_max; j++) {
+            O_acc[i][j] = 0.0f;
+        }
+    }
+    
+    // Main loop over K,V blocks
+    const int num_blocks = div_up(N, Bc);
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const int col_block_start = block_idx * Bc;
+        const int col_block_end = min(col_block_start + Bc, N);
+        const int actual_Bc = col_block_end - col_block_start;
+        
+        __syncthreads();
+        
+        // Collaboratively load K and V tiles to shared memory
+        for (int idx = tid; idx < actual_Bc * d; idx += num_threads) {
+            int col_in_block = idx / d;
+            int d_idx = idx % d;
+            int global_col = col_block_start + col_in_block;
+            K_smem[col_in_block * d + d_idx] = K[global_col * d + d_idx];
+            V_smem[col_in_block * d + d_idx] = V[global_col * d + d_idx];
+        }
+        
+        __syncthreads();
+        
+        // Compute S = Q @ K^T for this warp's rows
+        float S_row[Bc];
+        
+        for (int local_row = 0; local_row < rows_per_warp; local_row++) {
+            int global_row = global_row_start + warp_row_start + local_row;
+            if (global_row < global_row_end) {
+                // Compute dot products
+                for (int col = 0; col < actual_Bc; col++) {
+                    float dot = 0.0f;
+                    // Only access elements this thread loaded
+                    for (int k = lane_id; k < d; k += WARP_SIZE) {
+                        dot += Q_reg[local_row][k] * K_smem[col * d + k];
+                    }
+                    // Perform warp reduction to sum all threads' contributions
+                    dot = warp_reduce_sum(dot);
+                    S_row[col] = dot * softmax_scale;
+                }
+                
+                // Online softmax - compute row max
+                float row_max = -INFINITY;
+                for (int col = 0; col < actual_Bc; col++) {
+                    row_max = fmaxf(row_max, S_row[col]);
+                }
+                
+                // Update statistics
+                float m_new = fmaxf(m[local_row], row_max);
+                float exp_diff = expf(m[local_row] - m_new);
+                
+                // Compute exp and sum
+                float row_sum = 0.0f;
+                #pragma unroll
+                for (int col = 0; col < actual_Bc; col++) {
+                    S_row[col] = expf(S_row[col] - m_new);
+                    row_sum += S_row[col];
+                }
+                
+                // Update output accumulator with rescaling
+                #pragma unroll
+                for (int j = 0; j < d; j++) {
+                    O_acc[local_row][j] *= exp_diff;
+                }
+                
+                // Accumulate P @ V
+                #pragma unroll
+                for (int col = 0; col < actual_Bc; col++) {
+                    #pragma unroll
+                    for (int j = 0; j < d; j++) {
+                        O_acc[local_row][j] += S_row[col] * V_smem[col * d + j];
+                    }
+                }
+                
+                // Update running statistics
+                l[local_row] = exp_diff * l[local_row] + row_sum;
+                m[local_row] = m_new;
+            }
+        }
+    }
+    
+    // Write output - normalize and store
+    for (int local_row = 0; local_row < rows_per_warp; local_row++) {
+        int global_row = global_row_start + warp_row_start + local_row;
+        if (global_row < global_row_end) {
+            float inv_l = 1.0f / l[local_row];
+            for (int col = lane_id; col < d; col += WARP_SIZE) {
+                O[global_row * d + col] = O_acc[local_row][col] * inv_l;
+            }
+            // Store logsumexp
+            if (lane_id == 0) {
+                L[global_row] = m[local_row] + logf(l[local_row]);
+            }
+        }
+    }
+}
 
-}   
+// Host wrapper function
+void flash_attention_2_forward(
+    const float* Q,
+    const float* K, 
+    const float* V,
+    float* O,
+    float* L,
+    int seq_len,
+    int head_dim,
+    float softmax_scale,
+    cudaStream_t stream = 0
+) {
+    // Configure kernel parameters
+    const int Br = 64;  // Row block size
+    const int Bc = 64;  // Column block size
+    const int num_warps = 4;
+    const int threads_per_block = num_warps * WARP_SIZE;
+    const int d_max = 128;  // Maximum supported head dimension
+    
+    assertc(head_dim <= d_max); // Constraint for this implementation
+    assertc(Br % num_warps == 0);
+    
+    int num_row_blocks = div_up(seq_len, Br);
+    
+
+
+    dim3 grid = new_dim3(num_row_blocks,1,1);
+    dim3 block = new_dim3(threads_per_block,1,1);
+    
+    int smem_size = 2 * Bc * head_dim * sizeof(float); // K_smem + V_smem
+    
+    if (head_dim <= 64) {
+        #ifndef __INTELLISENSE__
+        flash_attention_2_forward_kernel<Br, Bc, 64, num_warps><<<grid, block, smem_size, stream>>>(
+            Q, K, V, O, L, seq_len, head_dim, softmax_scale
+        );
+        #endif
+    } else {
+        
+        #ifndef INTELLISENSE
+        flash_attention_2_forward_kernel<Br, Bc, 128, num_warps><<<grid, block, smem_size, stream>>>(
+            Q, K, V, O, L, seq_len, head_dim, softmax_scale
+        );
+        #endif
+    }
+}

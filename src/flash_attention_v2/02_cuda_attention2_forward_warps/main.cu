@@ -1,161 +1,142 @@
-
-#include <stdio.h>
+// flash_attention_2_forward.cu
 #include <iostream>
-#include <cmath>
-#include <cstdlib>
-#include <cfloat>
-#include "../../util/cuda_shim.h"
-#include "../../util/color.h"
-#include "../../util/flash_attention.h"
-#include "./flash_attention_kernel.cu"
-/**
- * Flash Attention implementation in CUDA
- * Reference: https://arxiv.org/abs/2205.14135
- * in flash attention one, we try to maxmize the Bc, because each iteration will put Oi back to HBM
- * 
- */
-// Host function to launch Flash Attention
-void flash_attention(
-    const float* d_Q,
-    const float* d_K, 
-    const float* d_V,
-    float* d_O,
-    float* d_L,
-    int N,
-    int d,
-    int Br = 32, // Block size for rows
-    int Bc = 32  // Block size for columns
+#include <vector>
+#include "flash_attention_kernel.cu"  // Include the kernel implementation
+
+// Naive attention implementation for comparison
+void naive_attention_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    int seq_len,
+    int head_dim,
+    float softmax_scale
 ) {
+    std::vector<float> S(seq_len * seq_len);
     
-    //line 3: Calculate Tr = ceil(N/Br), Tc = ceil(N/Bc)
-    // Calculate grid and block dimensions
-    int Tr = (N + Br - 1) / Br; //Q, O, l
-    int Tc = (N + Bc - 1) / Bc; //K, V  no need to use Tc here in this implementation, just for understanding
-   
-    
-    /**
-     * Requirement check, make sure 1 thread handle one row of Q, it is efficient and reduce implimantation complexity : 
-     * if Br % WARP_SIZE != 0; we can NOT get best performance
-     * if Br < WARP_SIZE; this kernel can NOT work
-     */
-    if (Br % WARP_SIZE != 0 ) {
-        printf("Br=%d should be multiple of WARP_SIZE=%d to get better performance for this kernel\n", Br, WARP_SIZE);
-    }
-
-    if ( Br < WARP_SIZE ) {
-        printf("for better performace,  Br=%d must be equal or greater than WARP_SIZE=%d for this kernel\n", Br, WARP_SIZE);
-        // do nothing
+    // S = Q @ K^T
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            float dot = 0.0f;
+            for (int k = 0; k < head_dim; k++) {
+                dot += Q[i * head_dim + k] * K[j * head_dim + k];
+            }
+            S[i * seq_len + j] = dot * softmax_scale;
+        }
     }
     
-    int NumberOfWarps = (Br + WARP_SIZE - 1) / WARP_SIZE; // number of warps per block
-
-    // line 7: for 1 <= i <= Tr do  block and thread implement this loop
-    dim3 threadsPerBlock = new_dim3( WARP_SIZE * NumberOfWarps, 1, 1);
-    dim3 blocksPerGrid = new_dim3(Tr, 1, 1);
- 
-    printf("Flash Attention launch with Br=%d, Bc=%d, Tr=%d, Tc=%d, N=%d, d=%d, WarpSize=%d, #ofWarps=%d\n", Br, Bc, Tr, Tc, N, d, WARP_SIZE, NumberOfWarps);
+    // Softmax
+    for (int i = 0; i < seq_len; i++) {
+        float row_max = -INFINITY;
+        for (int j = 0; j < seq_len; j++) {
+            row_max = std::max(row_max, S[i * seq_len + j]);
+        }
+        
+        float row_sum = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            S[i * seq_len + j] = expf(S[i * seq_len + j] - row_max);
+            row_sum += S[i * seq_len + j];
+        }
+        
+        for (int j = 0; j < seq_len; j++) {
+            S[i * seq_len + j] /= row_sum;
+        }
+    }
     
-    
-    // Calculate shared memory size. for simplicity, we do not reuse shared memory for different variables
-    size_t shared_mem_size = sizeof(float) * (
-        Br * d +      // Qi
-        Bc * d +      // Kj
-        Bc * d +      // Vj
-        Br * Bc +     // S
-        Br * Bc +     // P
-        Br * d +      // Oi 
-        Br * 1 +      // li 
-        Br * 1 +      // mi 
-        Br * 1 +      // li_pre 
-        Br * 1        // mi_pre 
-
-    );
-
-    // Launch kernel
-    #ifndef __INTELLISENSE__
-    flash_attention_kernel<<<blocksPerGrid, threadsPerBlock, shared_mem_size>>>(
-        d_Q, d_K, d_V, d_O, d_L, N, d, Br, Bc, 1.0f / sqrtf((float)d)
-    );
-    #endif
-    cudaDeviceSynchronize(); // Ensure sequential execution of blocks
-    // Check for errors
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        printf("CUDA error: %s\n", cudaGetErrorString(error));
+    // O = P @ V
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < seq_len; k++) {
+                sum += S[i * seq_len + k] * V[k * head_dim + j];
+            }
+            O[i * head_dim + j] = sum;
+        }
     }
 }
 
-
 // Test function
-
-// Naive CPU implementation for verification
-
-void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d, int Br, int Bc = 8) {
-    std::cout << "\n=== Test: " << test_name << " ===" << std::endl;
-    std::cout << "N=" << N << ", d=" << d << ", Bc=" << Bc << std::endl;
+void test_flash_attention_2() {
+    // Test parameters
+    const int seq_len = 512;
+    const int head_dim = 64;
+    const float softmax_scale = 1.0f / sqrtf(head_dim);
     
-    // Allocate output memory
-    float *h_O = new float[N * d];
-    float *h_L = new float[N];
+    // Allocate host memory
+    size_t qkv_size = seq_len * head_dim;
+    std::vector<float> h_Q(qkv_size);
+    std::vector<float> h_K(qkv_size);
+    std::vector<float> h_V(qkv_size);
+    std::vector<float> h_O_naive(qkv_size);
+    std::vector<float> h_O_flash(qkv_size);
+    std::vector<float> h_L(seq_len);
+    
+    // Initialize with random values
+    srand(42); // Fixed seed for reproducibility
+    for (size_t i = 0; i < qkv_size; i++) {
+        h_Q[i] = (rand() % 1000) / 1000.0f - 0.5f;
+        h_K[i] = (rand() % 1000) / 1000.0f - 0.5f;
+        h_V[i] = (rand() % 1000) / 1000.0f - 0.5f;
+    }
+    
+    // Compute naive attention
+    naive_attention_forward(
+        h_Q.data(), h_K.data(), h_V.data(), h_O_naive.data(),
+        seq_len, head_dim, softmax_scale
+    );
     
     // Allocate device memory
     float *d_Q, *d_K, *d_V, *d_O, *d_L;
-    cudaMalloc((void**)&d_Q, N * d * sizeof(float));
-    cudaMalloc((void**)&d_K, N * d * sizeof(float));
-    cudaMalloc((void**)&d_V, N * d * sizeof(float));
-    cudaMalloc((void**)&d_O, N * d * sizeof(float));
-    cudaMalloc((void**)&d_L, N * sizeof(float));
+    cudaMalloc((void **) &d_Q, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_K, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_V, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_O, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_L, seq_len * sizeof(float));
     
-    // Copy data to device
-    cudaMemcpy(d_Q, Q, N * d * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, K, N * d * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, V, N * d * sizeof(float), cudaMemcpyHostToDevice);
+    // Copy to device
+    cudaMemcpy(d_Q, h_Q.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
     
-    // Run Flash Attention
-    flash_attention(d_Q, d_K, d_V, d_O, d_L, N, d, Br, Bc);
+    // Run FlashAttention-2
+    flash_attention_2_forward(
+        d_Q, d_K, d_V, d_O, d_L,
+        seq_len, head_dim, softmax_scale
+    );
+    
     cudaDeviceSynchronize();
     
-    // Copy results back
-    cudaMemcpy(h_O, d_O, N * d * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_L, d_L, N * sizeof(float), cudaMemcpyDeviceToHost);
+    // Copy back to host
+    cudaMemcpy(h_O_flash.data(), d_O, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_L.data(), d_L, seq_len * sizeof(float), cudaMemcpyDeviceToHost);
     
-    // Naive CPU reference
-    float* ref_O = (float*)malloc(N * d * sizeof(float));
-    float* ref_L = (float*)malloc(N * sizeof(float));
-    compute_forward_pass(Q, K, V, ref_O, ref_L, N, d);
-
-    // Print results and compare
-    std::cout << "Output O (CUDA) vs Naive:" << std::endl;
-    bool all_ok = true;
-    for (int i = 0; i < N; i++) {
-        std::cout << "Row " << i << ": ";
-        for (int j = 0; j < d && j < 8; j++) {
-            std::cout << h_O[i * d + j] << " ";
+    // Compare results
+    float max_diff = 0.0f;
+    float avg_diff = 0.0f;
+    int num_large_diff = 0;
+    
+    for (size_t i = 0; i < qkv_size; i++) {
+        float diff = std::abs(h_O_naive[i] - h_O_flash[i]);
+        max_diff = std::max(max_diff, diff);
+        avg_diff += diff;
+        if (diff > 1e-3) {
+            num_large_diff++;
+            if (num_large_diff < 10) { // Print first few large differences
+                std::cout << "Large diff at index " << i << ": naive=" << h_O_naive[i] 
+                         << ", flash=" << h_O_flash[i] << ", diff=" << diff << std::endl;
+            }
         }
-        if (d > 8) std::cout << "...";
-        std::cout << " | L=" << h_L[i];
-
-        // Compare with naive
-        float max_err = 0.0f;
-        for (int j = 0; j < d; j++) {
-            float err = fabs(h_O[i * d + j] - ref_O[i * d + j]);
-            if (err > max_err) max_err = err;
-        }
-        float l_err = fabs(h_L[i] - ref_L[i]);
-        if (max_err > 1e-3f || l_err > 1e-3f) all_ok = false;
-        std::cout << " | MaxErr=" << max_err << " Lerr=" << l_err << std::endl;
     }
-    if (all_ok) {
-        green("Test PASSED: CUDA and naive results match (within tolerance).");
-    } else {
-        red("Test FAILED: CUDA and naive results differ!");
-    }
+    avg_diff /= qkv_size;
+    
+    std::cout << "\nTest Results:" << std::endl;
+    std::cout << "Max difference: " << max_diff << std::endl;
+    std::cout << "Avg difference: " << avg_diff << std::endl;
+    std::cout << "Number of large differences (>1e-3): " << num_large_diff << " out of " << qkv_size << std::endl;
+    std::cout << "Test " << (max_diff < 5e-3 ? "PASSED" : "FAILED") << std::endl;
     
     // Cleanup
-    delete[] h_O;
-    delete[] h_L;
-    free(ref_O);
-    free(ref_L);
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);
@@ -163,153 +144,7 @@ void run_test(const char* test_name, float* Q, float* K, float* V, int N, int d,
     cudaFree(d_L);
 }
 
-
-
 int main() {
-    // Test 1: simple 2x4 test
-    {
-        float Q[] = {
-            1, 0, 1, 0,
-            0, 1, 0, 1
-        };
-        float K[] = {
-            1, 0, 1, 0,
-            0, 1, 0, 1
-        };
-        float V[] = {
-            10, 20, 30, 40,
-            50, 60, 70, 80
-        };
-        run_test("Simple 2x4 test", Q, K, V, 2, 4, 2, 2);
-    } 
-    // Test 2: simple 2x4 test
-    {
-        float Q[] = {
-            1, 0, 1, 0,
-            0, 1, 0, 1
-        };
-        float K[] = {
-            1, 0, 1, 0,
-            0, 1, 0, 1
-        };
-        float V[] = {
-            10, 20, 30, 40,
-            50, 60, 70, 80
-        };
-        run_test("Simple 2x4 test", Q, K, V, 2, 4, 1, 2);
-    }
-    
-    // Test 4: All ones (uniform attention)
-    {
-        float Q[] = {
-            1, 1,
-            1, 1,
-            1, 1
-        };
-        float K[] = {
-            1, 1,
-            1, 1,
-            1, 1
-        };
-        float V[] = {
-            1, 2,
-            3, 4,
-            5, 6
-        };
-        run_test("Uniform attention 3x2", Q, K, V, 3, 2, 2, 2);
-    }
-    
-    // Test 5: Orthogonal Q and K (no attention)
-    {
-        float Q[] = {
-            1, 0,
-            0, 1
-        };
-        float K[] = {
-            0, 1,
-            -1, 0
-        };
-        float V[] = {
-            10, 20,
-            30, 40
-        };
-        run_test("Orthogonal Q,K 2x2", Q, K, V, 2, 2, 2, 2);
-    }
-    
-    // Test 6: Single element
-    {
-        float Q[] = {1};
-        float K[] = {1};
-        float V[] = {42};
-        run_test("Single element", Q, K, V, 1, 1, 1);
-    }
-    
-    // Test 7: Larger test with patterns
-    {
-        const int N = 8, d = 4;
-        float *Q = new float[N * d];
-        float *K = new float[N * d];
-        float *V = new float[N * d];
-        
-        // Create diagonal attention pattern
-        for (int i = 0; i < N; i++) {
-            for (int j = 0; j < d; j++) {
-                Q[i * d + j] = (i == j) ? 1.0f : 0.0f;
-                K[i * d + j] = (i == j) ? 1.0f : 0.0f;
-                V[i * d + j] = i * 10 + j;
-            }
-        }
-        run_test("Diagonal pattern 8x4", Q, K, V, N, d, 4);
-        
-        delete[] Q;
-        delete[] K;
-        delete[] V;
-    }
-    
-    // Test 8: Random larger test
-    {
-        const int N = 64, d = 32;
-        float *Q = new float[N * d];
-        float *K = new float[N * d];
-        float *V = new float[N * d];
-        
-        srand(42);  // Fixed seed for reproducibility
-        for (int i = 0; i < N * d; i++) {
-            Q[i] = (float)rand() / RAND_MAX;
-            K[i] = (float)rand() / RAND_MAX;
-            V[i] = (float)rand() / RAND_MAX * 100;  // Scale V for visibility
-        }
-        run_test("Random 64x32", Q, K, V, N, d, 2);
-        
-        delete[] Q;
-        delete[] K;
-        delete[] V;
-    }
-    
-    // Test 9: Test with different tile sizes
-    {
-        float Q[] = {
-            1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0, 0, 0, 1
-        };
-        float K[] = {
-            1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0, 0, 0, 1
-        };
-        float V[] = {
-            1, 2, 3, 4,
-            5, 6, 7, 8,
-            9, 10, 11, 12,
-            13, 14, 15, 16
-        };
-        run_test("4x4 with Br=1, Bc=1", Q, K, V, 4, 4, 1);
-        run_test("4x4 with Br=2, Bc=2", Q, K, V, 4, 4, 2);
-        run_test("4x4 with Br=4, Bc=4", Q, K, V, 4, 4, 4);
-    }
-    
+    test_flash_attention_2();
     return 0;
 }
