@@ -26,6 +26,14 @@ __device__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// Add this warp reduction function for max at the top of the file with other helpers
+__device__ float warp_reduce_max(float val) {
+    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+        val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, mask));
+    }
+    return val;
+}
+
 template <int Br, int Bc, int d_max, int num_warps>
 __global__ void flash_attention_2_forward_kernel(
     const float*  Q,
@@ -64,6 +72,7 @@ __global__ void flash_attention_2_forward_kernel(
     float Q_reg[rows_per_warp][cols_per_thread];  // +1 to handle when d is not divisible by WARP_SIZE
     
     // Load Q tile for this warp
+    // each warp loads its assigned rows, each thread loads its assigned columns
     for (int local_row = 0; local_row < rows_per_warp; local_row++) {
         int global_row = global_row_start + warp_row_start + local_row;
         if (global_row < global_row_end) {
@@ -112,12 +121,10 @@ __global__ void flash_attention_2_forward_kernel(
         __syncthreads();
         
         // Collaboratively load K and V tiles to shared memory
+        int col_block_start_idx = col_block_start * d;
         for (int idx = tid; idx < actual_Bc * d; idx += num_threads) {
-            int col_in_block = idx / d;
-            int d_idx = idx % d;
-            int global_col = col_block_start + col_in_block;
-            K_smem[col_in_block * d + d_idx] = K[global_col * d + d_idx];
-            V_smem[col_in_block * d + d_idx] = V[global_col * d + d_idx];
+            K_smem[idx] = K[col_block_start_idx + idx];
+            V_smem[idx] = V[col_block_start_idx + idx];
         }
         
         __syncthreads();
@@ -125,30 +132,36 @@ __global__ void flash_attention_2_forward_kernel(
         // Compute S = Q @ K^T for this warp's rows
         float S_row[Bc];
         
-        for (int local_row = 0; local_row < rows_per_warp; local_row++) {
+        for (int local_row = 0; local_row < rows_per_warp; local_row++) { // each row of Q in this warp
             int global_row = global_row_start + warp_row_start + local_row;
             if (global_row < global_row_end) {
                 // Compute dot products
-                for (int col = 0; col < actual_Bc; col++) {
+                for (int col = 0; col < actual_Bc; col++) { // each column in K_smem
                     float dot = 0.0f;
-                    // Access Q_reg correctly using the column offset format
-                    for (int k = lane_id; k < d; k += WARP_SIZE) {
-                        int local_idx = k % WARP_SIZE;
-                        float q_val = __shfl_sync(FULL_MASK, 
-                            Q_reg[local_row][k/WARP_SIZE], 
-                            local_idx);
-                        dot += q_val * K_smem[col * d + k];
+                    // Access Q_reg and K_smem to compute dot product
+                    for (int k = lane_id; k < d; k += WARP_SIZE) { // each dimension
+                        int q_col = k / WARP_SIZE;
+                        float q_val = Q_reg[local_row][q_col];
+                        dot += q_val * K_smem[col * d + k];  
                     }
                     // Perform warp reduction to sum all threads' contributions
-                    dot = warp_reduce_sum(dot);
-                    S_row[col] = dot * softmax_scale;
+                    dot = warp_reduce_sum(dot);     //got result for one element of S_row before scaling
+                    
+                    //We store S_row in all threads instead of only lane 0 to avoid warp communication, since we need it for softmax
+                    //if we have limited registers we can optimize it further by only storing in lane 0 and broadcasting later, but this is simpler and faster 
+                    S_row[col] = dot * softmax_scale;  
                 }
                 
+
                 // Online softmax - compute row max
                 float row_max = -INFINITY;
-                for (int col = 0; col < actual_Bc; col++) {
+                // Each thread processes its chunk of columns
+                for (int col = lane_id; col < actual_Bc; col += WARP_SIZE) {
                     row_max = fmaxf(row_max, S_row[col]);
                 }
+                // Reduce across warp
+                row_max = warp_reduce_max(row_max);
+
                 
                 // Update statistics
                 float m_new = fmaxf(m[local_row], row_max);
@@ -156,7 +169,6 @@ __global__ void flash_attention_2_forward_kernel(
                 
                 // Compute exp and sum
                 float row_sum = 0.0f;
-                #pragma unroll
                 for (int col = 0; col < actual_Bc; col++) {
                     S_row[col] = expf(S_row[col] - m_new);
                     row_sum += S_row[col];

@@ -142,7 +142,7 @@ void test_flash_attention_2() {
     std::cout << "\nFirst 4 rows,8cols of FlashAttention-2 output O:" << std::endl;
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < min(head_dim,8); j++) {
-            std::cout << h_O_flash[ head_dim + j] << " ";
+            std::cout << h_O_flash[i * head_dim + j] << " ";
         }
         std::cout << std::endl;
     }
