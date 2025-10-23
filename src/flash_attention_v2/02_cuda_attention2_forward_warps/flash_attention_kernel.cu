@@ -19,7 +19,7 @@ __host__ __device__ inline int div_up(int a, int b) {
 
 // Warp-level reduction for sum
 __device__ float warp_reduce_sum(float val) {
-    #pragma unroll
+    //#pragma unroll
     for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
         val += __shfl_xor_sync(FULL_MASK, val, mask);
     }
@@ -28,11 +28,11 @@ __device__ float warp_reduce_sum(float val) {
 
 template <int Br, int Bc, int d_max, int num_warps>
 __global__ void flash_attention_2_forward_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
-    float* __restrict__ O,
-    float* __restrict__ L,
+    const float*  Q,
+    const float*  K,
+    const float*  V,
+    float*  O,
+    float*  L,
     const int N,
     const int d,
     const float softmax_scale
@@ -53,6 +53,7 @@ __global__ void flash_attention_2_forward_kernel(
     
     // Each warp handles different rows
     const int rows_per_warp = Br / num_warps;
+    const int cols_per_thread = (d_max + WARP_SIZE - 1) / WARP_SIZE;
     const int warp_row_start = warp_id * rows_per_warp;
     
     // Global row indices for this thread block
@@ -60,14 +61,20 @@ __global__ void flash_attention_2_forward_kernel(
     const int global_row_end = min(global_row_start + Br, N);
     
     // Registers for Q tile (each warp loads its portion)
-    float Q_reg[rows_per_warp][d_max];
+    float Q_reg[rows_per_warp][cols_per_thread];  // +1 to handle when d is not divisible by WARP_SIZE
     
     // Load Q tile for this warp
     for (int local_row = 0; local_row < rows_per_warp; local_row++) {
         int global_row = global_row_start + warp_row_start + local_row;
         if (global_row < global_row_end) {
-            for (int col = lane_id; col < d; col += WARP_SIZE) {
-                Q_reg[local_row][col] = Q[global_row * d + col];
+            // Each thread only loads its assigned columns
+            for (int col_offset = 0; col_offset < cols_per_thread; col_offset++) {
+                int col = lane_id + col_offset * WARP_SIZE;
+                if (col < d) {
+                    Q_reg[local_row][col_offset] = Q[global_row * d + col];
+                } else {
+                    Q_reg[local_row][col_offset] = 0.0f;
+                }
             }
         } else {
             for (int col = lane_id; col < d; col += WARP_SIZE) {
@@ -82,15 +89,16 @@ __global__ void flash_attention_2_forward_kernel(
     // Initialize row-wise statistics
     float m[rows_per_warp];
     float l[rows_per_warp];
-    float O_acc[rows_per_warp][d_max];
+    // Each thread only needs to store its portion of O_acc
+    float O_acc[rows_per_warp][cols_per_thread];
     
-    #pragma unroll
+    //#pragma unroll
     for (int i = 0; i < rows_per_warp; i++) {
         m[i] = -INFINITY;
         l[i] = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < d_max; j++) {
-            O_acc[i][j] = 0.0f;
+        // Each thread only initializes its columns
+        for (int col_offset = 0; col_offset < cols_per_thread; col_offset++) {
+            O_acc[i][col_offset] = 0.0f;
         }
     }
     
@@ -123,9 +131,13 @@ __global__ void flash_attention_2_forward_kernel(
                 // Compute dot products
                 for (int col = 0; col < actual_Bc; col++) {
                     float dot = 0.0f;
-                    // Only access elements this thread loaded
+                    // Access Q_reg correctly using the column offset format
                     for (int k = lane_id; k < d; k += WARP_SIZE) {
-                        dot += Q_reg[local_row][k] * K_smem[col * d + k];
+                        int local_idx = k % WARP_SIZE;
+                        float q_val = __shfl_sync(FULL_MASK, 
+                            Q_reg[local_row][k/WARP_SIZE], 
+                            local_idx);
+                        dot += q_val * K_smem[col * d + k];
                     }
                     // Perform warp reduction to sum all threads' contributions
                     dot = warp_reduce_sum(dot);
@@ -151,17 +163,21 @@ __global__ void flash_attention_2_forward_kernel(
                 }
                 
                 // Update output accumulator with rescaling
-                #pragma unroll
-                for (int j = 0; j < d; j++) {
-                    O_acc[local_row][j] *= exp_diff;
+                for (int col_offset = 0; col_offset < cols_per_thread; col_offset++) {
+                    int col = lane_id + col_offset * WARP_SIZE;
+                    if (col < d) {
+                        O_acc[local_row][col_offset] *= exp_diff;
+                    }
                 }
-                
+
                 // Accumulate P @ V
-                #pragma unroll
-                for (int col = 0; col < actual_Bc; col++) {
-                    #pragma unroll
-                    for (int j = 0; j < d; j++) {
-                        O_acc[local_row][j] += S_row[col] * V_smem[col * d + j];
+                for (int k = 0; k < actual_Bc; k++) {
+                    float s_val = S_row[k];
+                    for (int col_offset = 0; col_offset < cols_per_thread; col_offset++) {
+                        int col = lane_id + col_offset * WARP_SIZE;
+                        if (col < d) {
+                            O_acc[local_row][col_offset] += s_val * V_smem[k * d + col];
+                        }
                     }
                 }
                 
@@ -177,8 +193,12 @@ __global__ void flash_attention_2_forward_kernel(
         int global_row = global_row_start + warp_row_start + local_row;
         if (global_row < global_row_end) {
             float inv_l = 1.0f / l[local_row];
-            for (int col = lane_id; col < d; col += WARP_SIZE) {
-                O[global_row * d + col] = O_acc[local_row][col] * inv_l;
+            // Each thread writes its portion of the output
+            for (int col_offset = 0; col_offset < cols_per_thread; col_offset++) {
+                int col = lane_id + col_offset * WARP_SIZE;
+                if (col < d) {
+                    O[global_row * d + col] = O_acc[local_row][col_offset] * inv_l;
+                }
             }
             // Store logsumexp
             if (lane_id == 0) {
@@ -197,8 +217,7 @@ void flash_attention_2_forward(
     float* L,
     int seq_len,
     int head_dim,
-    float softmax_scale,
-    cudaStream_t stream = 0
+    float softmax_scale
 ) {
     // Configure kernel parameters
     const int Br = 64;  // Row block size
@@ -221,13 +240,13 @@ void flash_attention_2_forward(
     
     if (head_dim <= 64) {
         #ifndef __INTELLISENSE__
-        flash_attention_2_forward_kernel<Br, Bc, 64, num_warps><<<grid, block, smem_size, stream>>>(
+        flash_attention_2_forward_kernel<Br, Bc, 64, num_warps><<<grid, block, smem_size>>>(
             Q, K, V, O, L, seq_len, head_dim, softmax_scale
         );
         #endif
     } else {
         #ifndef __INTELLISENSE__
-        flash_attention_2_forward_kernel<Br, Bc, 128, num_warps><<<grid, block, smem_size, stream>>>(
+        flash_attention_2_forward_kernel<Br, Bc, 128, num_warps><<<grid, block, smem_size>>>(
             Q, K, V, O, L, seq_len, head_dim, softmax_scale
         );
         #endif
