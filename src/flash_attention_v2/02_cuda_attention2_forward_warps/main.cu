@@ -51,7 +51,12 @@ void naive_attention_forward(
             float sum = 0.0f;
             for (int k = 0; k < seq_len; k++) {
                 sum += S[i * seq_len + k] * V[k * head_dim + j];
+                // std::cout << "i=" << i << ", j=" << j << ", k=" << k 
+                //           << ", S=" << S[i * seq_len + k] 
+                //           << ", V=" << V[k * head_dim + j] 
+                //           << ", partial_sum=" << sum << std::endl; // Debug print
             }
+
             O[i * head_dim + j] = sum;
         }
     }
@@ -162,7 +167,158 @@ void test_flash_attention_2() {
     cudaFree(d_L);
 }
 
+// Test function with simple integer values for manual verification
+void test_simple_attention() {
+    std::cout << "\n=== Simple Test Case ===" << std::endl;
+    
+    // Simple test parameters
+    const int seq_len = 4;
+    const int head_dim = 4;
+    const float softmax_scale = 1.0f;
+    
+    // Allocate host memory
+    size_t qkv_size = seq_len * head_dim;
+    float* h_Q = new float[qkv_size];
+    float* h_K = new float[qkv_size];
+    float* h_V = new float[qkv_size];
+    float* h_O_naive = new float[qkv_size];
+    float* h_O_flash = new float[qkv_size];
+    float* h_L = new float[seq_len];
+    
+    // Initialize with simple integer values
+    // Q matrix (4x4)
+    float Q_vals[] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        1.0f, 1.0f, 0.0f, 0.0f
+    };
+    
+    // K matrix (4x4) - same as Q for simplicity
+    float K_vals[] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        1.0f, 1.0f, 0.0f, 0.0f
+    };
+    
+    // V matrix (4x4) - distinct values for each row
+    float V_vals[] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f,
+        13.0f, 14.0f, 15.0f, 16.0f
+    };
+    
+    memcpy(h_Q, Q_vals, qkv_size * sizeof(float));
+    memcpy(h_K, K_vals, qkv_size * sizeof(float));
+    memcpy(h_V, V_vals, qkv_size * sizeof(float));
+    
+    // Print input matrices
+    std::cout << "\nInput Q matrix:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            std::cout << h_Q[i * head_dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    std::cout << "\nInput K matrix:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            std::cout << h_K[i * head_dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    std::cout << "\nInput V matrix:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            std::cout << h_V[i * head_dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    // Compute naive attention
+    naive_attention_forward(
+        h_Q, h_K, h_V, h_O_naive,
+        seq_len, head_dim, softmax_scale
+    );
+    
+    // Allocate device memory
+    float *d_Q, *d_K, *d_V, *d_O, *d_L;
+    cudaMalloc((void **) &d_Q, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_K, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_V, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_O, qkv_size * sizeof(float));
+    cudaMalloc((void **) &d_L, seq_len * sizeof(float));
+    
+    // Copy to device
+    cudaMemcpy(d_Q, h_Q, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    
+    // Run FlashAttention-2
+    flash_attention_2_forward(
+        d_Q, d_K, d_V, d_O, d_L,
+        seq_len, head_dim, softmax_scale
+    );
+    
+    cudaDeviceSynchronize();
+    
+    // Copy back to host
+    cudaMemcpy(h_O_flash, d_O, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_L, d_L, seq_len * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Print results
+    std::cout << "\nNaive Attention Output O:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            std::cout << h_O_naive[i * head_dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    std::cout << "\nFlashAttention-2 Output O:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < head_dim; j++) {
+            std::cout << h_O_flash[i * head_dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    std::cout << "\nLog-sum-exp values L:" << std::endl;
+    for (int i = 0; i < seq_len; i++) {
+        std::cout << "L[" << i << "] = " << h_L[i] << std::endl;
+    }
+    
+    // Compare results
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < qkv_size; i++) {
+        float diff = std::abs(h_O_naive[i] - h_O_flash[i]);
+        max_diff = std::max(max_diff, diff);
+    }
+    
+    std::cout << "\nMax difference: " << max_diff << std::endl;
+    std::cout << "Simple test " << (max_diff < 1e-4 ? "PASSED" : "FAILED") << std::endl;
+    
+    // Cleanup
+    delete[] h_Q;
+    delete[] h_K;
+    delete[] h_V;
+    delete[] h_O_naive;
+    delete[] h_O_flash;
+    delete[] h_L;
+    
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_O);
+    cudaFree(d_L);
+}
+
 int main() {
-    test_flash_attention_2();
+    test_simple_attention();  // Run simple test first
+    test_flash_attention_2(); // Run original test
     return 0;
 }
