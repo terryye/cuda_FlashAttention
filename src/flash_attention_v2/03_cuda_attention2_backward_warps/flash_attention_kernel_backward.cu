@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../util/cuda_shim.h"
-#include "../../util/assertc.h"
+#include "util/cuda_shim.h"
+#include "util/assertc.h"
 
 #include <stdio.h>
 #include <math.h>

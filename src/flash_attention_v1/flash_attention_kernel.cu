@@ -1,4 +1,4 @@
-#include "../../util/cuda_shim.h"
+#include "util/cuda_shim.h"
 #include <stdio.h>
 #include <math.h>
 #include <cfloat>

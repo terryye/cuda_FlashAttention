@@ -1,7 +1,7 @@
 
 #include <stdio.h>
 #include <iostream>
-#include "../../util/cuda_shim.h"
+#include "util/cuda_shim.h"
 #include "./flash_attention_kernel.cu"
 
 // Host function to launch Flash Attention

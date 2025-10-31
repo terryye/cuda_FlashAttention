@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../util/cuda_shim.h"
-#include "../../util/assertc.h"
+#include "util/cuda_shim.h"
+#include "util/assertc.h"
 #include <stdio.h>
 #include <math.h>
 #include <cfloat>
@@ -308,7 +308,7 @@ void flash_attention_2_forward(
 ) {
     // Configure kernel parameters
     const int Br = 2;  // Row block size
-    const int Bc = 2;  // Column block size
+    const int Bc = 4;  // Column block size
     const int num_warps = 2;
     const int threads_per_block = num_warps * WARP_SIZE;
     const int d_max = 64;  // Maximum supported head dimension
