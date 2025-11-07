@@ -115,7 +115,11 @@ int main(int argc, char* argv[]) {
     if (rank == 0) {
         h_O_gathered.resize(seq_len * head_dim);
     }
-    
+
+    //The messages are concatenated on the root process in the order of the process ranks, so the data from rank 0 comes first, followed by rank 1, and so on.
+    // int MPI_Gather(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+    //                void *recvbuf, int recvcount, MPI_Datatype recvtype, int root,
+    //                MPI_Comm comm)
     MPI_Gather(h_O_local.data(), local_seq_len * head_dim, MPI_FLOAT,
                h_O_gathered.data(), local_seq_len * head_dim, MPI_FLOAT,
                0, MPI_COMM_WORLD);
