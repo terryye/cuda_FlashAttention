@@ -227,7 +227,7 @@ void ring_attention_forward(
 
 
 
-    }
+    }s
     
     // No separate normalization needed - it's done inline!
     
