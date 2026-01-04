@@ -1,10 +1,8 @@
 #pragma once
 #define WARP_SIZE 32
 
-#include "util/cuda_shim.h"
 #include "util/cuda_helper.h"
 #include "util/attention_helper.h"
-#include "util/assertc.h"
 #include <stdio.h>
 #include <math.h>
 #include <cfloat>
@@ -149,8 +147,8 @@ void flash_attention_2_forward(
     const int threads_per_block = num_warps * WARP_SIZE;
     const int d_max = 64;  // Maximum supported head dimension
 
-    assertc(head_dim <= d_max); // Constraint for this implementation
-    assertc(Br % num_warps == 0);
+    assert(head_dim <= d_max); // Constraint for this implementation
+    assert(Br % num_warps == 0);
 
     int num_row_blocks = div_up(seq_len, Br);
 

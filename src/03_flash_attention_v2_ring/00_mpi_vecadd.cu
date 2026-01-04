@@ -2,16 +2,27 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "./util/util.cuh"
+#include <assert.h>
 
-__global__ void vector_add(float *a, float *b, float *c, int n) {
+#define CHK(call) \
+do { \
+cudaError_t err = call; \
+if (err != cudaSuccess) { \
+fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, \
+cudaGetErrorString(err)); \
+assert(0); \
+} \
+} while(0)
+
+
+__global__ void vector_add(float* a, float* b, float* c, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         c[idx] = a[idx] + b[idx];
     }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     // Initialize MPI
@@ -40,7 +51,7 @@ int main(int argc, char **argv) {
     CHK(cudaGetDeviceProperties(&prop, device));
 
     printf("Rank %d/%d using GPU %d (%s) with %d multiprocessors\n",
-           rank, size, device, prop.name, prop.multiProcessorCount);
+        rank, size, device, prop.name, prop.multiProcessorCount);
 
     // Problem size (each process handles a portion)
     const int n = 1000000;
@@ -50,9 +61,9 @@ int main(int argc, char **argv) {
     int offset = rank * base + (rank < rem ? rank : rem);
 
     // Allocate host memory per rank
-    float *h_a = (float*)malloc(count * sizeof(float));
-    float *h_b = (float*)malloc(count * sizeof(float));
-    float *h_c = (float*)malloc(count * sizeof(float));
+    float* h_a = (float*)malloc(count * sizeof(float));
+    float* h_b = (float*)malloc(count * sizeof(float));
+    float* h_c = (float*)malloc(count * sizeof(float));
 
     // Initialize data
     for (int i = 0; i < count; i++) {
@@ -62,7 +73,7 @@ int main(int argc, char **argv) {
     }
 
     // Allocate device memory
-    float *d_a, *d_b, *d_c;
+    float* d_a, * d_b, * d_c;
     CHK(cudaMalloc(&d_a, count * sizeof(float)));
     CHK(cudaMalloc(&d_b, count * sizeof(float)));
     CHK(cudaMalloc(&d_c, count * sizeof(float)));
@@ -81,7 +92,7 @@ int main(int argc, char **argv) {
     CHK(cudaEventCreate(&stop));
 
     CHK(cudaEventRecord(start));
-    vector_add<<<gridSize, blockSize>>>(d_a, d_b, d_c, count);
+    vector_add << <gridSize, blockSize >> > (d_a, d_b, d_c, count);
     CHK(cudaEventRecord(stop));
     CHK(cudaEventSynchronize(stop));          // not DeviceSynchronize
     CHK(cudaEventElapsedTime(&milliseconds, start, stop));
@@ -103,12 +114,12 @@ int main(int argc, char **argv) {
     }
 
     printf("Rank %d: Processed %d elements in %.2f ms on GPU %d - %s\n",
-           rank, count, milliseconds, device, success ? "SUCCESS" : "FAILED");
+        rank, count, milliseconds, device, success ? "SUCCESS" : "FAILED");
 
 
     // Verify sum using reduce
     float local_sum = 0;
-    for (int i = 0; i<count; i++) {
+    for (int i = 0; i < count; i++) {
         local_sum += h_c[i];
     }
 
@@ -118,10 +129,11 @@ int main(int argc, char **argv) {
 
     if (rank == 0) {
         float nf = n;
-        if (fabsf(global_sum - 3.0 * nf*(nf-1)/2) < 0.001) {
-            printf("global sum check FAILED: %f\n",global_sum);
-        } else {
-            printf("global sum check SUCEEDED: %f\n",global_sum);
+        if (fabsf(global_sum - 3.0 * nf * (nf - 1) / 2) < 0.001) {
+            printf("global sum check FAILED: %f\n", global_sum);
+        }
+        else {
+            printf("global sum check SUCEEDED: %f\n", global_sum);
         }
     }
 

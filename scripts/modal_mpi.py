@@ -2,9 +2,11 @@ import modal
 from modal import FilePatternMatcher
 import os
 
-MODAL_APP_NAME = "info7535-skb"
+MODAL_APP_NAME = "cuda_attention"
 
 script_dir = os.path.dirname(__file__)
+root_dir = os.path.abspath(os.path.join(script_dir, ".."))
+
 image = (
     modal.Image.from_registry(f"nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
         .apt_install( ["openmpi-bin", "libopenmpi-dev"])
@@ -14,6 +16,7 @@ image = (
             "OMPI_MCA_btl_vader_single_copy_mechanism": "none", # remove this by add the SYS_PTRACE capability to docker run
         })
         .add_local_dir(".", remote_path="/root", ignore=FilePatternMatcher("**/output.bin*"))
+        .add_local_dir(root_dir + "/src/util", remote_path="/root/util")
         .add_local_dir(script_dir, remote_path="/root/scripts")
 )
 
@@ -72,7 +75,7 @@ def compile_and_run_cuda(code_path: str, cuda_count: int):
            "-lm",
            "-lnccl",
            "-lcudart",
-            "-I/root/includes",
+            "-I/root",
             "-I/usr/lib/x86_64-linux-gnu/openmpi/include",  # MPI include path
             "-L/usr/lib/x86_64-linux-gnu/openmpi/lib",      # MPI library path
            "-o", "./output.bin", code_path]

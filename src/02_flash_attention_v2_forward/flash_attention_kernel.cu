@@ -1,12 +1,11 @@
 #pragma once
 
-#include "util/cuda_shim.h"
-#include "util/assertc.h"
 #include <stdio.h>
 #include <math.h>
 #include <cfloat>
 #include <math.h>
 #include <float.h>
+#include <assert.h>
 
 
 #define WARP_SIZE 2
@@ -20,7 +19,7 @@ __host__ __device__ inline int div_up(int a, int b) {
 // Warp-level reduction for sum
 __device__ float warp_reduce_sum(float val) {
     //#pragma unroll
-    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
         //_sync so we don't have to worry about divergence, no need to __syncwarp() here
         val += __shfl_xor_sync(FULL_MASK, val, mask);
     }
@@ -29,7 +28,7 @@ __device__ float warp_reduce_sum(float val) {
 
 // Add this warp reduction function for max at the top of the file with other helpers
 __device__ float warp_reduce_max(float val) {
-    for (int mask = WARP_SIZE/2; mask > 0; mask /= 2) {
+    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
         val = fmaxf(val, __shfl_xor_sync(FULL_MASK, val, mask));
     }
     return val;
@@ -37,42 +36,42 @@ __device__ float warp_reduce_max(float val) {
 
 template <int Br, int Bc, int d_max, int num_warps>
 __global__ void flash_attention_2_forward_kernel(
-    const float*  Q,
-    const float*  K,
-    const float*  V,
-    float*  O,
-    float*  L,
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    float* L,
     const int N,
     const int d,
     const float softmax_scale
 ) {
     // Thread block handles one block row of attention matrix
     const int row_block_idx = blockIdx.x;
-    
+
     // Shared memory for K and V tiles
     extern __shared__ float smem[];
     float* K_smem = smem; // [Bc][d]
     float* V_smem = smem + Bc * d; // [Bc][d]
-    
+
     // Thread and warp identifiers
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
     const int num_threads = blockDim.x;
-    
+
     // Each warp handles different rows
     const int rows_per_warp = Br / num_warps;
     const int cols_per_thread = (d_max + WARP_SIZE - 1) / WARP_SIZE;
     const int rows_per_thread = (rows_per_warp + WARP_SIZE - 1) / WARP_SIZE;
     const int warp_row_start = warp_id * rows_per_warp;
-    
+
     // Global row indices for this thread block
     const int global_row_start = row_block_idx * Br;
     const int global_row_end = min(global_row_start + Br, N);
-    
+
     // Registers for Q tile (each warp loads its portion)
     float Q_reg[rows_per_warp][cols_per_thread];  // +1 to handle when d is not divisible by WARP_SIZE
-    
+
     // Load Q tile for this warp
     // each warp loads its assigned rows, each thread loads its assigned columns
     for (int local_row = 0; local_row < rows_per_warp; local_row++) {
@@ -83,26 +82,28 @@ __global__ void flash_attention_2_forward_kernel(
                 int col = lane_id + col_offset * WARP_SIZE;
                 if (col < d) {
                     Q_reg[local_row][col_offset] = Q[global_row * d + col];
-                } else {
+                }
+                else {
                     Q_reg[local_row][col_offset] = 0.0f;
                 }
             }
-        } else {
+        }
+        else {
             for (int col = lane_id; col < d; col += WARP_SIZE) {
                 Q_reg[local_row][col] = 0.0f;
             }
         }
     }
-    
+
     // Ensure all threads in warp have loaded their Q values
     __syncwarp();
-    
+
     // // Initialize row-wise statistics
     // float m[rows_per_warp];
     // float l[rows_per_warp];
 
     // there is a little redundancy here since each warp only process one row at a time, but it's easier to manage this way.
-    float l[rows_per_warp]; 
+    float l[rows_per_warp];
     float m[rows_per_warp];
 
     // Each thread only needs to store its portion of O_acc, the same position as Q_reg; actually we can combine them later
@@ -114,31 +115,31 @@ __global__ void flash_attention_2_forward_kernel(
         l[i] = 0.0f; // initialize l for each row
         m[i] = -INFINITY; // initialize m for each row
     }
-    
+
 
     const int S_row_size_per_thread = (Bc - 1 + WARP_SIZE) / WARP_SIZE;
-    
+
     // Main loop over K,V blocks
     const int num_blocks = div_up(N, Bc);
     for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
         const int col_block_start = block_idx * Bc;
         const int col_block_end = min(col_block_start + Bc, N);
         const int actual_Bc = col_block_end - col_block_start;
-        
+
         __syncthreads();
-        
+
         // Collaboratively load K and V tiles to shared memory
         int col_block_start_idx = col_block_start * d;
         for (int idx = tid; idx < actual_Bc * d; idx += num_threads) {
             K_smem[idx] = K[col_block_start_idx + idx];
             V_smem[idx] = V[col_block_start_idx + idx];
         }
-        
+
         __syncthreads();
-        
+
         // Compute S = Q @ K^T for this warp's rows
         float S_row[S_row_size_per_thread];// each thread's portion of S_row
-        
+
         for (int local_row = 0; local_row < rows_per_warp; local_row++) { // each row of Q in this warp
             float row_max = -INFINITY;
 
@@ -151,22 +152,22 @@ __global__ void flash_attention_2_forward_kernel(
                     for (int k = lane_id; k < d; k += WARP_SIZE) { // each dimension
                         int q_col = k / WARP_SIZE;
                         float q_val = Q_reg[local_row][q_col];
-                        dot += q_val * K_smem[col * d + k];   
+                        dot += q_val * K_smem[col * d + k];
                     }
                     // Perform warp reduction to sum all threads' contributions
                     dot = warp_reduce_sum(dot);     //got result for one element of S_row before scaling
-                    
+
                     //only store the elements assigned to this thread
-                    if ( col % WARP_SIZE == lane_id ){
+                    if (col % WARP_SIZE == lane_id) {
                         float v = dot * softmax_scale;
-                        S_row[col / WARP_SIZE] = v ;
+                        S_row[col / WARP_SIZE] = v;
                         row_max = fmaxf(row_max, v);
-                    } 
+                    }
                 }
                 //reduction to get row_max  across all threads in the warp
                 row_max = warp_reduce_max(row_max);
                 __syncwarp();
-                
+
                 // //print debug info for S_Row
                 // __syncthreads();
                 // if (tid == 0){
@@ -187,7 +188,7 @@ __global__ void flash_attention_2_forward_kernel(
                  */
 
                 float m_new = fmaxf(m[local_row], row_max);
-                
+
                 // if(lane_id == 0){
                 //     printf( "Row %d: m_old=%f, row_max=%f, m=%f\n", rows_per_warp * warp_id + local_row, m_old, row_max, m);
                 // }
@@ -220,7 +221,7 @@ __global__ void flash_attention_2_forward_kernel(
                 float exp_diff = expf(m[local_row] - m_new);
                 l[local_row] = exp_diff * l[local_row] + row_sum;
                 m[local_row] = m_new;
-                
+
 
 
                 // __syncthreads();
@@ -258,11 +259,11 @@ __global__ void flash_attention_2_forward_kernel(
                     }
                 }
             }
-            
+
         }
         __syncwarp();
     }
-    
+
     //debug show O_acc
     // __syncthreads();
     // for(int local_row=0; local_row<rows_per_warp; local_row++){
@@ -274,7 +275,7 @@ __global__ void flash_attention_2_forward_kernel(
     //     }
     // }
     // __syncthreads();
-    
+
     // Write output - normalize and store
     for (int local_row = 0; local_row < rows_per_warp; local_row++) {
         int global_row = global_row_start + warp_row_start + local_row;
@@ -298,7 +299,7 @@ __global__ void flash_attention_2_forward_kernel(
 // Host wrapper function
 void flash_attention_2_forward(
     const float* Q,
-    const float* K, 
+    const float* K,
     const float* V,
     float* O,
     float* L,
@@ -312,30 +313,31 @@ void flash_attention_2_forward(
     const int num_warps = 2;
     const int threads_per_block = num_warps * WARP_SIZE;
     const int d_max = 64;  // Maximum supported head dimension
-    
-    assertc(head_dim <= d_max); // Constraint for this implementation
-    assertc(Br % num_warps == 0);
-    
+
+    assert(head_dim <= d_max); // Constraint for this implementation
+    assert(Br % num_warps == 0);
+
     int num_row_blocks = div_up(seq_len, Br);
-    
 
 
-    dim3 grid = new_dim3(num_row_blocks,1,1);
-    dim3 block = new_dim3(threads_per_block,1,1);
-    
+
+    dim3 grid = dim3(num_row_blocks, 1, 1);
+    dim3 block = dim3(threads_per_block, 1, 1);
+
     int smem_size = 2 * Bc * head_dim * sizeof(float); // K_smem + V_smem
-    
+
     if (head_dim <= 64) {
-        #ifndef __INTELLISENSE__
-        flash_attention_2_forward_kernel<Br, Bc, 64, num_warps><<<grid, block, smem_size>>>(
+#ifndef __INTELLISENSE__
+        flash_attention_2_forward_kernel<Br, Bc, 64, num_warps> << <grid, block, smem_size >> > (
             Q, K, V, O, L, seq_len, head_dim, softmax_scale
-        );
-        #endif
-    } else {
-        #ifndef __INTELLISENSE__
-        flash_attention_2_forward_kernel<Br, Bc, 128, num_warps><<<grid, block, smem_size>>>(
+            );
+#endif
+    }
+    else {
+#ifndef __INTELLISENSE__
+        flash_attention_2_forward_kernel<Br, Bc, 128, num_warps> << <grid, block, smem_size >> > (
             Q, K, V, O, L, seq_len, head_dim, softmax_scale
-        );
-        #endif
+            );
+#endif
     }
 }

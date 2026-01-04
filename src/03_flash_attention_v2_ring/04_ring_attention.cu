@@ -3,6 +3,7 @@
 #include <vector>
 #include <mpi.h>
 #include "util/nccl_utils.h"
+#include "util/naive_attention.h"
 #include "./common/ring_attention_kernel.cu"
 
 int main(int argc, char* argv[]) {
