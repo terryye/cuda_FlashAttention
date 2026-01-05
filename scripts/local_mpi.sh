@@ -37,6 +37,8 @@ else
 fi
 # Get the directory containing this script
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# Get the src directory 
+SRC_DIR=$(dirname "$SCRIPT_DIR")/src
 
 set -x
 # compile and run the code
@@ -48,6 +50,7 @@ nvcc -DCUDA=1 -g -G -rdc=true \
        -lcudart \
        -lcudadevrt \
        -I/usr/lib/x86_64-linux-gnu/openmpi/include \
+        -I ${SRC_DIR} \
        -L/usr/lib/x86_64-linux-gnu/openmpi/lib \
        -o ./bin/output.bin $1
 
