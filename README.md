@@ -43,9 +43,10 @@ cd src/01_flash_attention_v1
 ./run_local.sh
 ```
 
-for ring attention,
+for ring attention, it is a little different
 
 ```bash
+cd src/03_flash_attention_v2_ring
 ./run.sh 00 # will run 00_mpi_vecadd.cu only
 ./run.sh 01 # will run 01_nccl_verify.cu only
 # ... etc.

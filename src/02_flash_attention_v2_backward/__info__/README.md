@@ -116,13 +116,6 @@ Total: 4 × Bc × d floats
 ./run.sh
 ```
 
-Or manually:
-
-```bash
-cd ../..  # Go to repo root
-modal run scripts/modal_nvcc.py --code-path week_05/03_cuda_attention2_backward_warps/main.cu
-```
-
 ## Expected Output
 
 The test outputs will show:
